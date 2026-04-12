@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use hyperfun_core::config::AppConfig;
-use hyperfun_core::{Candle, CandleIndicator, HlSignalProvider, MarketData, SignalAction};
+use hyperfun_core::{Candle, CandleIndicator, Direction, HlSignalProvider, MarketData, SignalAction};
 use hyperfun_executor::PaperExecutor;
 use hyperfun_market::rest::HlRestClient;
 use hyperfun_market::ws::HlWsClient;
@@ -271,6 +271,7 @@ async fn main() -> Result<()> {
 
     let hl_native_weight = config.indicators.hl_native.weight;
     let funding_weight = config.indicators.funding.weight;
+    let trend_tf = config.timeframes.trend.clone();
 
     loop {
         tokio::select! {
@@ -346,8 +347,29 @@ async fn main() -> Result<()> {
 
                 let (composite_score, details) = aggregator.compute_score(&factor_scores);
 
+                // MTF filter: check trend-TF direction from the last closed
+                // higher-timeframe candle. If the signal opposes the trend, suppress it.
+                let trend_direction = engine.candle_store()
+                    .last(&symbol, &trend_tf)
+                    .map(|c| {
+                        if c.close > c.open { Direction::Long } else { Direction::Short }
+                    });
+
                 // Decide action
                 let action = aggregator.decide(&symbol, composite_score);
+
+                // Apply MTF filter: suppress signals that oppose the higher-TF trend
+                let action = match (action, trend_direction) {
+                    (SignalAction::Open(Direction::Long), Some(Direction::Short)) => {
+                        info!(symbol = %symbol, "MTF filter: suppressed Long signal (trend is Short)");
+                        SignalAction::Hold
+                    }
+                    (SignalAction::Open(Direction::Short), Some(Direction::Long)) => {
+                        info!(symbol = %symbol, "MTF filter: suppressed Short signal (trend is Long)");
+                        SignalAction::Hold
+                    }
+                    (action, _) => action,
+                };
 
                 // Get current ATR value for stop-loss sizing
                 let current_atr = state.atr_for_stop.atr_value();
