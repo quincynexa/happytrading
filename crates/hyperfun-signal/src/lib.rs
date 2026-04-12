@@ -1,2 +1,5 @@
 // hyperfun-signal: Factor scoring and signal aggregation
-// Stub - implementation in future tasks.
+pub mod indicators;
+pub mod hl_signals;
+pub mod factors;
+pub mod aggregator;
