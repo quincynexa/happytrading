@@ -1,0 +1,62 @@
+[general]
+mode = "paper"
+log_level = "info"
+
+[symbols]
+watchlist = ["BTC", "ETH", "SOL"]
+min_daily_volume = 1000000
+
+[timeframes]
+trend = "4h"
+entry = "15m"
+
+[indicators.trend]
+ema_short = 20
+ema_long = 50
+macd_fast = 12
+macd_slow = 26
+macd_signal = 9
+supertrend_period = 10
+supertrend_multiplier = 3.0
+weight = 0.25
+
+[indicators.momentum]
+rsi_period = 14
+rsi_overbought = 70
+rsi_oversold = 30
+cci_period = 20
+weight = 0.15
+
+[indicators.volatility]
+atr_period = 14
+bollinger_period = 20
+bollinger_std = 2.0
+weight = 0.10
+
+[indicators.hl_native]
+hlp_vault_address = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"
+whale_addresses = []
+liquidation_lookback_secs = 300
+weight = 0.25
+
+[indicators.funding]
+funding_extreme_threshold = 0.01
+weight = 0.15
+
+[indicators.mtf]
+weight = 0.10
+
+[signal]
+open_threshold = 0.6
+close_threshold = 0.2
+
+[paper]
+simulated_slippage_pct = 0.05
+simulated_fee_pct = 0.035
+position_size_usd = 1000
+atr_stop_multiplier = 2.0
+summary_interval_mins = 60
+
+[hyperliquid]
+ws_url = "wss://api.hyperliquid.xyz/ws"
+rest_url = "https://api.hyperliquid.xyz"

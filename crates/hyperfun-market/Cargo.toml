@@ -1,0 +1,14 @@
+[package]
+name = "hyperfun-market"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hyperfun-core = { path = "../hyperfun-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
+anyhow = { workspace = true }
