@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -21,6 +23,78 @@ use hyperfun_signal::indicators::macd::MacdHistogram;
 use hyperfun_signal::indicators::rsi::Rsi;
 use hyperfun_signal::indicators::supertrend::Supertrend;
 
+/// Per-symbol state: independent indicator instances so that candles from
+/// different symbols never pollute each other's EMA / RSI / etc.
+struct SymbolState {
+    trend_group: FactorGroup,
+    momentum_group: FactorGroup,
+    volatility_group: FactorGroup,
+    atr_for_stop: Atr,
+    hlp_signal: HlpInventorySignal,
+    liquidation_signal: LiquidationSignal,
+    whale_signal: WhaleFlowSignal,
+    funding_signal: FundingSignal,
+}
+
+impl SymbolState {
+    fn new(config: &AppConfig) -> Self {
+        let tc = &config.indicators.trend;
+        let mut trend_group = FactorGroup::new("trend", tc.weight);
+        trend_group.add_indicator(Box::new(EmaCrossover::new(
+            tc.ema_short as usize,
+            tc.ema_long as usize,
+        )));
+        trend_group.add_indicator(Box::new(MacdHistogram::new(
+            tc.macd_fast as usize,
+            tc.macd_slow as usize,
+            tc.macd_signal as usize,
+        )));
+        trend_group.add_indicator(Box::new(Supertrend::new(
+            tc.supertrend_period as usize,
+            tc.supertrend_multiplier,
+        )));
+
+        let mc = &config.indicators.momentum;
+        let mut momentum_group = FactorGroup::new("momentum", mc.weight);
+        momentum_group.add_indicator(Box::new(Rsi::new(
+            mc.rsi_period as usize,
+            mc.rsi_overbought,
+            mc.rsi_oversold,
+        )));
+        momentum_group.add_indicator(Box::new(Cci::new(mc.cci_period as usize)));
+
+        let vc = &config.indicators.volatility;
+        let mut volatility_group = FactorGroup::new("volatility", vc.weight);
+        volatility_group.add_indicator(Box::new(Atr::new(vc.atr_period as usize)));
+        volatility_group.add_indicator(Box::new(BollingerBandsIndicator::new(
+            vc.bollinger_period as usize,
+            vc.bollinger_std,
+        )));
+
+        let atr_for_stop = Atr::new(vc.atr_period as usize);
+
+        let hlp_signal = HlpInventorySignal::new();
+        let liquidation_signal = LiquidationSignal::new(
+            config.indicators.hl_native.liquidation_lookback_secs as i64,
+        );
+        let whale_signal = WhaleFlowSignal::new();
+        let funding_signal = FundingSignal::new(
+            config.indicators.funding.funding_extreme_threshold,
+        );
+
+        Self {
+            trend_group,
+            momentum_group,
+            volatility_group,
+            atr_for_stop,
+            hlp_signal,
+            liquidation_signal,
+            whale_signal,
+            funding_signal,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // ── 1. Load config ───────────────────────────────────────────────────
@@ -41,70 +115,19 @@ async fn main() -> Result<()> {
     let mut engine = MarketDataEngine::new(&config);
     engine.backfill().await?;
 
-    // ── 4. Create factor groups ──────────────────────────────────────────
-    let tc = &config.indicators.trend;
-    let mut trend_group = FactorGroup::new("trend", tc.weight);
-    trend_group.add_indicator(Box::new(EmaCrossover::new(
-        tc.ema_short as usize,
-        tc.ema_long as usize,
-    )));
-    trend_group.add_indicator(Box::new(MacdHistogram::new(
-        tc.macd_fast as usize,
-        tc.macd_slow as usize,
-        tc.macd_signal as usize,
-    )));
-    trend_group.add_indicator(Box::new(Supertrend::new(
-        tc.supertrend_period as usize,
-        tc.supertrend_multiplier,
-    )));
-
-    let mc = &config.indicators.momentum;
-    let mut momentum_group = FactorGroup::new("momentum", mc.weight);
-    momentum_group.add_indicator(Box::new(Rsi::new(
-        mc.rsi_period as usize,
-        mc.rsi_overbought,
-        mc.rsi_oversold,
-    )));
-    momentum_group.add_indicator(Box::new(Cci::new(mc.cci_period as usize)));
-
-    let vc = &config.indicators.volatility;
-    let mut volatility_group = FactorGroup::new("volatility", vc.weight);
-    // We keep a separate ATR for stop-loss calculations; the one inside the
-    // volatility group is used purely for scoring.
-    volatility_group.add_indicator(Box::new(Atr::new(vc.atr_period as usize)));
-    volatility_group.add_indicator(Box::new(BollingerBandsIndicator::new(
-        vc.bollinger_period as usize,
-        vc.bollinger_std,
-    )));
-
-    // Per-symbol standalone ATR used by the executor for stop-loss distance.
-    // (keyed by symbol)
-    let mut atr_for_stop: std::collections::HashMap<String, Atr> =
-        std::collections::HashMap::new();
+    // ── 4. Create per-symbol state (independent indicator instances) ─────
+    let mut symbol_states: HashMap<String, SymbolState> = HashMap::new();
     for sym in &config.symbols.watchlist {
-        atr_for_stop.insert(sym.clone(), Atr::new(vc.atr_period as usize));
+        symbol_states.insert(sym.clone(), SymbolState::new(&config));
     }
 
-    // ── 5. Create HL-native signals ──────────────────────────────────────
-    // NOTE: these signals won't receive data until REST polling tasks are
-    // spawned (not implemented yet). They'll return ready() = false and be
-    // excluded from scoring. That's OK for the initial version.
-    let hlp_signal = HlpInventorySignal::new();
-    let liquidation_signal = LiquidationSignal::new(
-        config.indicators.hl_native.liquidation_lookback_secs as i64,
-    );
-    let whale_signal = WhaleFlowSignal::new();
-    let funding_signal = FundingSignal::new(
-        config.indicators.funding.funding_extreme_threshold,
-    );
-
-    // ── 6. Create SignalAggregator ───────────────────────────────────────
+    // ── 5. Create SignalAggregator ───────────────────────────────────────
     let mut aggregator = SignalAggregator::new(
         config.signal.open_threshold,
         config.signal.close_threshold,
     );
 
-    // ── 7. Create PaperExecutor ──────────────────────────────────────────
+    // ── 6. Create PaperExecutor ──────────────────────────────────────────
     let mut executor = PaperExecutor::new(
         config.paper.simulated_slippage_pct,
         config.paper.simulated_fee_pct,
@@ -112,7 +135,7 @@ async fn main() -> Result<()> {
         config.paper.atr_stop_multiplier,
     );
 
-    // ── 8. Warm up indicators with backfilled candle data ────────────────
+    // ── 7. Warm up indicators with backfilled candle data ────────────────
     let entry_tf = &config.timeframes.entry;
     for symbol in &config.symbols.watchlist {
         let candles = engine
@@ -120,26 +143,26 @@ async fn main() -> Result<()> {
             .get_last_n(symbol, entry_tf, 500);
 
         let count = candles.len();
-        for candle in candles {
-            trend_group.update_all(candle);
-            momentum_group.update_all(candle);
-            volatility_group.update_all(candle);
-            if let Some(atr) = atr_for_stop.get_mut(symbol) {
-                atr.update(candle);
+        if let Some(state) = symbol_states.get_mut(symbol) {
+            for candle in candles {
+                state.trend_group.update_all(candle);
+                state.momentum_group.update_all(candle);
+                state.volatility_group.update_all(candle);
+                state.atr_for_stop.update(candle);
             }
-        }
 
-        info!(
-            symbol = %symbol,
-            candles_warmed = count,
-            trend_ready = trend_group.ready(),
-            momentum_ready = momentum_group.ready(),
-            volatility_ready = volatility_group.ready(),
-            "indicators warmed up"
-        );
+            info!(
+                symbol = %symbol,
+                candles_warmed = count,
+                trend_ready = state.trend_group.ready(),
+                momentum_ready = state.momentum_group.ready(),
+                volatility_ready = state.volatility_group.ready(),
+                "indicators warmed up"
+            );
+        }
     }
 
-    // ── 9. Spawn WS candle stream task ───────────────────────────────────
+    // ── 8. Spawn WS candle stream task ───────────────────────────────────
     let (candle_tx, mut candle_rx) = mpsc::channel::<Candle>(256);
     let ws_client = HlWsClient::new(engine.ws_url());
     let ws_symbols = config.symbols.watchlist.clone();
@@ -154,7 +177,7 @@ async fn main() -> Result<()> {
 
     info!("WS candle stream spawned — entering main loop");
 
-    // ── 10. Main loop ────────────────────────────────────────────────────
+    // ── 9. Main loop ─────────────────────────────────────────────────────
     let summary_interval_ms =
         (config.paper.summary_interval_mins as i64) * 60 * 1000;
     let mut last_summary_ts: i64 = 0;
@@ -176,13 +199,17 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        // Update indicators
-        trend_group.update_all(&candle);
-        momentum_group.update_all(&candle);
-        volatility_group.update_all(&candle);
-        if let Some(atr) = atr_for_stop.get_mut(&symbol) {
-            atr.update(&candle);
-        }
+        // Look up this symbol's state
+        let state = match symbol_states.get_mut(&symbol) {
+            Some(s) => s,
+            None => continue, // unknown symbol, skip
+        };
+
+        // Update indicators with this symbol's candle
+        state.trend_group.update_all(&candle);
+        state.momentum_group.update_all(&candle);
+        state.volatility_group.update_all(&candle);
+        state.atr_for_stop.update(&candle);
 
         // Check stop losses first
         executor.check_stop_losses(&symbol, price);
@@ -190,27 +217,26 @@ async fn main() -> Result<()> {
             aggregator.clear_position(&symbol);
         }
 
-        // Compute composite score
-        // Build the factor_scores slice for the aggregator.
+        // Compute composite score using this symbol's indicators
         // HL-native signals are included but will return None when not ready,
         // which causes them to be excluded from the weighted average.
-        let hl_native_score = if hlp_signal.ready()
-            || liquidation_signal.ready()
-            || whale_signal.ready()
+        let hl_native_score = if state.hlp_signal.ready()
+            || state.liquidation_signal.ready()
+            || state.whale_signal.ready()
         {
             // Average of whichever HL-native signals are ready
             let mut sum = 0.0f64;
             let mut n = 0u32;
-            if hlp_signal.ready() {
-                sum += hlp_signal.score();
+            if state.hlp_signal.ready() {
+                sum += state.hlp_signal.score();
                 n += 1;
             }
-            if liquidation_signal.ready() {
-                sum += liquidation_signal.score();
+            if state.liquidation_signal.ready() {
+                sum += state.liquidation_signal.score();
                 n += 1;
             }
-            if whale_signal.ready() {
-                sum += whale_signal.score();
+            if state.whale_signal.ready() {
+                sum += state.whale_signal.score();
                 n += 1;
             }
             Some(sum / n as f64)
@@ -218,16 +244,16 @@ async fn main() -> Result<()> {
             None
         };
 
-        let funding_score = if funding_signal.ready() {
-            Some(funding_signal.score())
+        let funding_score = if state.funding_signal.ready() {
+            Some(state.funding_signal.score())
         } else {
             None
         };
 
         let factor_scores: Vec<(&str, f64, Option<f64>)> = vec![
-            ("trend", trend_group.weight, trend_group.score()),
-            ("momentum", momentum_group.weight, momentum_group.score()),
-            ("volatility", volatility_group.weight, volatility_group.score()),
+            ("trend", state.trend_group.weight, state.trend_group.score()),
+            ("momentum", state.momentum_group.weight, state.momentum_group.score()),
+            ("volatility", state.volatility_group.weight, state.volatility_group.score()),
             ("hl_native", hl_native_weight, hl_native_score),
             ("funding", funding_weight, funding_score),
         ];
@@ -238,10 +264,7 @@ async fn main() -> Result<()> {
         let action = aggregator.decide(&symbol, composite_score);
 
         // Get current ATR value for stop-loss sizing
-        let current_atr = atr_for_stop
-            .get(&symbol)
-            .map(|a| a.atr_value())
-            .unwrap_or(0.0);
+        let current_atr = state.atr_for_stop.atr_value();
 
         // Execute via paper executor
         match action {
