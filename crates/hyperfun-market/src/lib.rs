@@ -2,3 +2,4 @@
 // Stub - implementation in future tasks.
 
 pub mod candle_store;
+pub mod rest;
