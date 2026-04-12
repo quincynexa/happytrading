@@ -5,8 +5,9 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use hyperfun_core::config::AppConfig;
-use hyperfun_core::{Candle, CandleIndicator, HlSignalProvider, SignalAction};
+use hyperfun_core::{Candle, CandleIndicator, HlSignalProvider, MarketData, SignalAction};
 use hyperfun_executor::PaperExecutor;
+use hyperfun_market::rest::HlRestClient;
 use hyperfun_market::ws::HlWsClient;
 use hyperfun_market::MarketDataEngine;
 use hyperfun_signal::aggregator::SignalAggregator;
@@ -162,7 +163,93 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── 8. Spawn WS candle stream task ───────────────────────────────────
+    // ── 8. Spawn REST polling tasks for HL-native data ───────────────────
+    let (md_tx, mut md_rx) = mpsc::channel::<MarketData>(256);
+
+    // Funding + OI poller (every 60s)
+    {
+        let md_tx_funding = md_tx.clone();
+        let rest_url = config.hyperliquid.rest_url.clone();
+        let symbols: std::collections::HashSet<String> =
+            config.symbols.watchlist.iter().cloned().collect();
+        tokio::spawn(async move {
+            let client = HlRestClient::new(&rest_url);
+            loop {
+                match client.fetch_predicted_fundings().await {
+                    Ok(fundings) => {
+                        for f in fundings {
+                            if symbols.contains(&f.symbol) {
+                                let _ = md_tx_funding.send(MarketData::Funding(f)).await;
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "funding poll failed"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+    }
+
+    // HLP vault poller (every 30s)
+    {
+        let md_tx_hlp = md_tx.clone();
+        let rest_url = config.hyperliquid.rest_url.clone();
+        let hlp_address = config.indicators.hl_native.hlp_vault_address.clone();
+        tokio::spawn(async move {
+            let client = HlRestClient::new(&rest_url);
+            loop {
+                match client.fetch_clearinghouse_state(&hlp_address).await {
+                    Ok(positions) => {
+                        for p in positions {
+                            let _ = md_tx_hlp.send(MarketData::HlpPosition(p)).await;
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "HLP poll failed"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+    }
+
+    // Whale position poller (every 30s) — polls each configured whale address
+    if !config.indicators.hl_native.whale_addresses.is_empty() {
+        let md_tx_whale = md_tx.clone();
+        let rest_url = config.hyperliquid.rest_url.clone();
+        let whale_addresses = config.indicators.hl_native.whale_addresses.clone();
+        tokio::spawn(async move {
+            let client = HlRestClient::new(&rest_url);
+            loop {
+                for address in &whale_addresses {
+                    match client.fetch_clearinghouse_state(address).await {
+                        Ok(positions) => {
+                            for p in positions {
+                                // Convert HlpData into WhaleData for the whale signal
+                                let whale = hyperfun_core::WhaleData {
+                                    address: address.clone(),
+                                    symbol: p.symbol,
+                                    position_size: p.position_size,
+                                    entry_price: p.entry_price,
+                                    timestamp: p.timestamp,
+                                };
+                                let _ = md_tx_whale.send(MarketData::WhalePosition(whale)).await;
+                            }
+                        }
+                        Err(e) => tracing::warn!(address = %address, error = %e, "whale poll failed"),
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+    }
+
+    // NOTE: Liquidation events require a separate WS subscription or parsing
+    // from the trade stream. No REST endpoint exists for live liquidation events.
+    // The LiquidationSignal will remain not-ready until that is implemented.
+
+    // Drop the original sender so the channel can close when all spawned tasks end
+    drop(md_tx);
+
+    // ── 9. Spawn WS candle stream task ───────────────────────────────────
     let (candle_tx, mut candle_rx) = mpsc::channel::<Candle>(256);
     let ws_client = HlWsClient::new(engine.ws_url());
     let ws_symbols = config.symbols.watchlist.clone();
@@ -175,9 +262,9 @@ async fn main() -> Result<()> {
         ws_client.run(ws_symbols, ws_intervals, candle_tx).await;
     });
 
-    info!("WS candle stream spawned — entering main loop");
+    info!("WS candle stream and REST pollers spawned — entering main loop");
 
-    // ── 9. Main loop ─────────────────────────────────────────────────────
+    // ── 10. Main loop (select over candle stream + market data channel) ──
     let summary_interval_ms =
         (config.paper.summary_interval_mins as i64) * 60 * 1000;
     let mut last_summary_ts: i64 = 0;
@@ -185,132 +272,164 @@ async fn main() -> Result<()> {
     let hl_native_weight = config.indicators.hl_native.weight;
     let funding_weight = config.indicators.funding.weight;
 
-    while let Some(candle) = candle_rx.recv().await {
-        let symbol = candle.symbol.clone();
-        let interval = candle.interval.clone();
-        let price = candle.close;
-        let timestamp = candle.close_time;
+    loop {
+        tokio::select! {
+            Some(candle) = candle_rx.recv() => {
+                let symbol = candle.symbol.clone();
+                let interval = candle.interval.clone();
+                let price = candle.close;
+                let timestamp = candle.close_time;
 
-        // Store in CandleStore
-        engine.candle_store_mut().push(candle.clone());
+                // Store in CandleStore
+                engine.candle_store_mut().push(candle.clone());
 
-        // Only process entry-timeframe candles for signal decisions
-        if interval != *entry_tf {
-            continue;
-        }
+                // Only process entry-timeframe candles for signal decisions
+                if interval != *entry_tf {
+                    continue;
+                }
 
-        // Look up this symbol's state
-        let state = match symbol_states.get_mut(&symbol) {
-            Some(s) => s,
-            None => continue, // unknown symbol, skip
-        };
+                // Look up this symbol's state
+                let state = match symbol_states.get_mut(&symbol) {
+                    Some(s) => s,
+                    None => continue, // unknown symbol, skip
+                };
 
-        // Update indicators with this symbol's candle
-        state.trend_group.update_all(&candle);
-        state.momentum_group.update_all(&candle);
-        state.volatility_group.update_all(&candle);
-        state.atr_for_stop.update(&candle);
+                // Update indicators with this symbol's candle
+                state.trend_group.update_all(&candle);
+                state.momentum_group.update_all(&candle);
+                state.volatility_group.update_all(&candle);
+                state.atr_for_stop.update(&candle);
 
-        // Check stop losses first
-        executor.check_stop_losses(&symbol, price);
-        if !executor.has_position(&symbol) {
-            aggregator.clear_position(&symbol);
-        }
+                // Check stop losses first
+                executor.check_stop_losses(&symbol, price);
+                if !executor.has_position(&symbol) {
+                    aggregator.clear_position(&symbol);
+                }
 
-        // Compute composite score using this symbol's indicators
-        // HL-native signals are included but will return None when not ready,
-        // which causes them to be excluded from the weighted average.
-        let hl_native_score = if state.hlp_signal.ready()
-            || state.liquidation_signal.ready()
-            || state.whale_signal.ready()
-        {
-            // Average of whichever HL-native signals are ready
-            let mut sum = 0.0f64;
-            let mut n = 0u32;
-            if state.hlp_signal.ready() {
-                sum += state.hlp_signal.score();
-                n += 1;
+                // Compute composite score using this symbol's indicators
+                let hl_native_score = if state.hlp_signal.ready()
+                    || state.liquidation_signal.ready()
+                    || state.whale_signal.ready()
+                {
+                    let mut sum = 0.0f64;
+                    let mut n = 0u32;
+                    if state.hlp_signal.ready() {
+                        sum += state.hlp_signal.score();
+                        n += 1;
+                    }
+                    if state.liquidation_signal.ready() {
+                        sum += state.liquidation_signal.score();
+                        n += 1;
+                    }
+                    if state.whale_signal.ready() {
+                        sum += state.whale_signal.score();
+                        n += 1;
+                    }
+                    Some(sum / n as f64)
+                } else {
+                    None
+                };
+
+                let funding_score = if state.funding_signal.ready() {
+                    Some(state.funding_signal.score())
+                } else {
+                    None
+                };
+
+                let factor_scores: Vec<(&str, f64, Option<f64>)> = vec![
+                    ("trend", state.trend_group.weight, state.trend_group.score()),
+                    ("momentum", state.momentum_group.weight, state.momentum_group.score()),
+                    ("volatility", state.volatility_group.weight, state.volatility_group.score()),
+                    ("hl_native", hl_native_weight, hl_native_score),
+                    ("funding", funding_weight, funding_score),
+                ];
+
+                let (composite_score, details) = aggregator.compute_score(&factor_scores);
+
+                // Decide action
+                let action = aggregator.decide(&symbol, composite_score);
+
+                // Get current ATR value for stop-loss sizing
+                let current_atr = state.atr_for_stop.atr_value();
+
+                // Execute via paper executor
+                match action {
+                    SignalAction::Open(dir) => {
+                        info!(
+                            symbol = %symbol,
+                            direction = ?dir,
+                            composite = composite_score,
+                            details = ?details,
+                            "signal: OPEN"
+                        );
+                        executor.execute_signal(action, &symbol, price, current_atr, timestamp);
+                        aggregator.set_position(&symbol, dir);
+                    }
+                    SignalAction::Close => {
+                        info!(
+                            symbol = %symbol,
+                            composite = composite_score,
+                            "signal: CLOSE"
+                        );
+                        executor.execute_signal(action, &symbol, price, current_atr, timestamp);
+                        aggregator.clear_position(&symbol);
+                    }
+                    SignalAction::Hold => {
+                        // Update unrealized PnL
+                        executor.update_unrealized_pnl(&symbol, price);
+                    }
+                }
+
+                // Log stats periodically
+                if timestamp - last_summary_ts >= summary_interval_ms {
+                    let stats = executor.stats();
+                    info!(
+                        total_trades = stats.total_trades,
+                        winning = stats.winning_trades,
+                        losing = stats.losing_trades,
+                        total_pnl = format!("{:.2}", stats.total_pnl),
+                        win_rate = format!("{:.1}%", stats.win_rate() * 100.0),
+                        max_drawdown = format!("{:.2}%", stats.max_drawdown * 100.0),
+                        profit_factor = format!("{:.2}", stats.profit_factor()),
+                        "periodic summary"
+                    );
+                    last_summary_ts = timestamp;
+                }
             }
-            if state.liquidation_signal.ready() {
-                sum += state.liquidation_signal.score();
-                n += 1;
+            Some(market_data) = md_rx.recv() => {
+                // Route HL-native market data to the correct symbol's signal providers
+                match &market_data {
+                    MarketData::Funding(f) => {
+                        if let Some(state) = symbol_states.get_mut(&f.symbol) {
+                            state.funding_signal.update(&market_data);
+                        }
+                    }
+                    MarketData::HlpPosition(h) => {
+                        if let Some(state) = symbol_states.get_mut(&h.symbol) {
+                            state.hlp_signal.update(&market_data);
+                        }
+                    }
+                    MarketData::Liquidation(l) => {
+                        if let Some(state) = symbol_states.get_mut(&l.symbol) {
+                            state.liquidation_signal.update(&market_data);
+                        }
+                    }
+                    MarketData::WhalePosition(w) => {
+                        if let Some(state) = symbol_states.get_mut(&w.symbol) {
+                            state.whale_signal.update(&market_data);
+                        }
+                    }
+                    MarketData::OpenInterest(_) | MarketData::CandleUpdate(_) => {
+                        // Not routed to signal providers currently
+                    }
+                }
             }
-            if state.whale_signal.ready() {
-                sum += state.whale_signal.score();
-                n += 1;
+            else => {
+                break;
             }
-            Some(sum / n as f64)
-        } else {
-            None
-        };
-
-        let funding_score = if state.funding_signal.ready() {
-            Some(state.funding_signal.score())
-        } else {
-            None
-        };
-
-        let factor_scores: Vec<(&str, f64, Option<f64>)> = vec![
-            ("trend", state.trend_group.weight, state.trend_group.score()),
-            ("momentum", state.momentum_group.weight, state.momentum_group.score()),
-            ("volatility", state.volatility_group.weight, state.volatility_group.score()),
-            ("hl_native", hl_native_weight, hl_native_score),
-            ("funding", funding_weight, funding_score),
-        ];
-
-        let (composite_score, details) = aggregator.compute_score(&factor_scores);
-
-        // Decide action
-        let action = aggregator.decide(&symbol, composite_score);
-
-        // Get current ATR value for stop-loss sizing
-        let current_atr = state.atr_for_stop.atr_value();
-
-        // Execute via paper executor
-        match action {
-            SignalAction::Open(dir) => {
-                info!(
-                    symbol = %symbol,
-                    direction = ?dir,
-                    composite = composite_score,
-                    details = ?details,
-                    "signal: OPEN"
-                );
-                executor.execute_signal(action, &symbol, price, current_atr, timestamp);
-                aggregator.set_position(&symbol, dir);
-            }
-            SignalAction::Close => {
-                info!(
-                    symbol = %symbol,
-                    composite = composite_score,
-                    "signal: CLOSE"
-                );
-                executor.execute_signal(action, &symbol, price, current_atr, timestamp);
-                aggregator.clear_position(&symbol);
-            }
-            SignalAction::Hold => {
-                // Update unrealized PnL
-                executor.update_unrealized_pnl(&symbol, price);
-            }
-        }
-
-        // Log stats periodically
-        if timestamp - last_summary_ts >= summary_interval_ms {
-            let stats = executor.stats();
-            info!(
-                total_trades = stats.total_trades,
-                winning = stats.winning_trades,
-                losing = stats.losing_trades,
-                total_pnl = format!("{:.2}", stats.total_pnl),
-                win_rate = format!("{:.1}%", stats.win_rate() * 100.0),
-                max_drawdown = format!("{:.2}%", stats.max_drawdown * 100.0),
-                profit_factor = format!("{:.2}", stats.profit_factor()),
-                "periodic summary"
-            );
-            last_summary_ts = timestamp;
         }
     }
 
-    warn!("candle stream ended — shutting down");
+    warn!("all streams ended — shutting down");
     Ok(())
 }
