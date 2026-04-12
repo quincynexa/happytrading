@@ -3,3 +3,4 @@
 
 pub mod candle_store;
 pub mod rest;
+pub mod ws;
