@@ -1,337 +1,316 @@
-# Hyperfun: Hyperliquid Perpetual Futures Automated Trading Bot
+<!-- /autoplan restore point: /Users/quincy/.gstack/projects/quincynexa-happytrading/main-autoplan-restore-20260412-213538.md -->
+# Hyperfun: Hyperliquid Perpetual Futures Trading Bot — Lean MVP
 
 ## Overview
 
-A trend-following (right-side trading) automated bot for perpetual futures on Hyperliquid. Uses a multi-factor signal engine across multiple symbols and timeframes, with comprehensive risk management, dual execution modes (paper/live), and full observability via Telegram, structured logging, and a web dashboard.
+Signal validation tool for trend-following (right-side) perpetual futures trading on Hyperliquid. V1 is a **lean MVP**: multi-factor signal engine with Hyperliquid-native data sources + paper executor. Console/log output only. The goal is to prove the strategy has positive expectancy before building infrastructure.
 
-## Architecture: Rust Monolith
+No dashboard. No Telegram. No PostgreSQL. No Docker. No live trading.
 
-Single Rust process housing all core modules, communicating in-process for minimum latency. TypeScript dashboard as a separate service. PostgreSQL for persistence.
+## Architecture
+
+Single Rust process, 4 crates. Local execution via `cargo run`.
 
 ```
-                    ┌─────────────────────────────────────────────┐
-                    │              Rust Monolith                   │
-                    │                                             │
- Hyperliquid ─WS──>│  MarketDataEngine                           │
-                    │    │  (multi-symbol candle aggregation,     │
-                    │    │   orderbook, trades)                   │
-                    │    v                                        │
-                    │  SignalEngine                                │
-                    │    │  (multi-timeframe x multi-symbol       │
-                    │    │   x multi-factor)                      │
-                    │    v                                        │
-                    │  RiskManager ──> Approve / Reject           │
-                    │    │                                        │
-                    │    v                                        │
-                    │  ExecutionEngine                             │
-                    │    │  (Paper Mode / Live Mode)               │
-                    │    v                                        │
-                    │  PortfolioTracker                            │
-                    │    │  (positions, PnL, equity curve)        │
-                    │    v                                        │
-                    │  NotificationService ──> Telegram            │
-                    │    │                                        │
-                    │    v                                        │
-                    │  REST API Server ──> TS Dashboard            │
-                    └─────────────────────────────────────────────┘
+Hyperliquid ─WS──> MarketDataEngine
+                      │
+                      ├── Candle stream (from HL candle WS)
+                      ├── Funding/OI (REST poll)
+                      ├── HLP vault positions (REST poll)
+                      ├── Liquidation events (WS)
+                      └── Whale address positions (REST poll)
                               │
                               v
-                    ┌─────────────────┐    ┌──────────────┐
-                    │   Config (TOML)  │    │  PostgreSQL   │
-                    └─────────────────┘    └──────────────┘
+                      SignalEngine
+                        │  (generic TA + HL-native factors)
+                        │  (multi-timeframe x multi-symbol)
+                        v
+                      PaperExecutor
+                        │  (realistic fill simulation)
+                        v
+                      Console + tracing logs
 ```
 
-**Priority ordering**: Performance > Stability > Flexibility > Observability
+**Priority ordering**: Signal Quality > Stability > Flexibility > Observability
 
 ## Module 1: MarketDataEngine
 
 ### Data Sources
 
-- **WebSocket (primary)**: Real-time trades, L2 orderbook, candles from Hyperliquid
-- **REST API (supplementary)**: Historical candle backfill, funding rate, open interest
+- **WebSocket**: HL candle subscriptions (15m, 1h, 4h), trades, liquidation events
+- **REST API**: Historical candle backfill, funding rate, open interest, HLP vault state, whale positions
 
 ### Design
 
-- **Candle aggregation from trades**: Not relying on exchange-pushed candles. Custom aggregation enables arbitrary timeframes. On startup, backfill history via REST, then aggregate in real-time.
-- **Multi-symbol concurrency**: Single WebSocket connection subscribes to all symbols. Incoming data dispatched by symbol to independent `CandleAggregator` tasks via `tokio`.
+- **Use Hyperliquid candle WebSocket** for standard timeframes (15m, 1h, 4h). Do NOT aggregate candles from trades in V1 (hidden complexity: boundary alignment, gap handling, partial candles on disconnect). Custom aggregation deferred to V2 if arbitrary timeframes are needed.
+- **Multi-symbol concurrency**: Single WS connection subscribes to all symbols. Data dispatched by symbol to independent tasks via `tokio`.
 - **Storage**: Ring buffer per symbol per timeframe, holding last N candles (configurable, default 500). In-memory only; backfilled from REST on restart.
-- **Funding/OI polling**: REST poll every 30s, storing recent history.
+- **HL-native data polling**:
+  - HLP vault positions: REST poll every 30s (`clearinghouseState` for HLP address)
+  - Funding rate: REST poll every 60s (`predictedFundings`, `fundingHistory`)
+  - Open interest: REST poll every 30s (from meta endpoint)
+  - Whale positions: REST poll every 60s (configurable address watchlist)
+- **Liquidation stream**: Subscribe to liquidation events via WS `userEvents` or parse from trade stream
 - **Fault tolerance**:
   - WebSocket auto-reconnect with exponential backoff
-  - Gap detection on reconnect, REST backfill for missed candles
+  - On reconnect: discard current in-progress candle, backfill completed candles from REST
+  - Mark all data as `stale` until backfill completes; signal engine checks stale flag
   - Anomaly detection: price jumps beyond threshold flagged to avoid false signals
+  - **Minimum volume filter**: symbols with < configurable daily volume threshold excluded from scanning
+
+### Data Types
+
+```rust
+/// Unified market data that flows into the signal engine
+enum MarketData {
+    Candle(CandleData),           // standard OHLCV
+    FundingRate(FundingData),     // current + predicted
+    OpenInterest(OIData),         // per-symbol OI
+    HlpPosition(HlpData),        // HLP vault inventory
+    Liquidation(LiquidationData), // per-event
+    WhalePosition(WhaleData),     // tracked address positions
+}
+```
 
 ## Module 2: SignalEngine
 
 ### Multi-Factor Architecture
 
 ```
-CandleStore --> IndicatorLayer --> FactorScorer --> SignalAggregator --> TradeSignal
-                 (raw values)     ([-1, +1])       (weighted sum)
+MarketData stream --> FactorGroups --> FactorScorer --> SignalAggregator --> TradeSignal
+                      (per type)      ([-1, +1])       (weighted sum)
 ```
 
-### Five Factor Groups
+### Six Factor Groups
 
-| Group | Indicators | Default Weight |
-|-------|-----------|----------------|
-| Trend | EMA20/50, MACD, Supertrend | 30% |
-| Momentum | RSI, CCI | 20% |
-| Volatility | ATR, Bollinger Bands | 15% |
-| Funding | Volume, Funding Rate, OI | 20% |
-| Multi-Timeframe | Higher TF trend alignment | 15% |
+| Group | Indicators | Input Type | Default Weight |
+|-------|-----------|------------|----------------|
+| Trend | EMA20/50, MACD, Supertrend | Candle | 25% |
+| Momentum | RSI, CCI | Candle | 15% |
+| Volatility | ATR, Bollinger Bands | Candle | 10% |
+| HL-Native | HLP inventory skew, liquidation cascade, whale flow | MarketData (non-candle) | 25% |
+| Funding | Predicted funding rate, funding rate trend, OI change | MarketData (non-candle) | 15% |
+| Multi-Timeframe | Higher TF trend alignment | Candle (higher TF) | 10% |
 
 ### Scoring
 
 - Each indicator outputs [-1.0, +1.0] (-1 = strong bearish, +1 = strong bullish)
-- Factor group score = weighted average of indicators within the group
-- Final score = weighted sum of all factor groups
+- **A factor group only scores when ALL its indicators report `ready() = true`**. If any indicator in a group is not ready, the group score is excluded and weights are NOT renormalized. The signal is suppressed until all groups are ready (warmup period).
+- Final score = weighted sum of all ready factor groups
+- **Signals generated only on bar close** (when a candle completes), never mid-bar
 - Signal trigger: score > +threshold (default 0.6) = long, < -threshold = short, |score| < exit_threshold (default 0.2) = close
+- **Idempotency**: one position per symbol max. Repeated same-direction signals are suppressed. Direction flip = close existing + open new.
 
 ### Multi-Timeframe Coordination
 
 - Higher timeframe (e.g. 4h) acts as a **direction filter**
 - Lower timeframe (e.g. 15m) provides **precise entry points**
+- **Always use the last fully closed higher-TF candle** for filtering, never in-progress
 - Only signals aligned with higher TF direction are accepted
 - Timeframe pairs are configurable
 
-### Indicator Trait
+### Indicator Traits
 
 ```rust
-trait Indicator: Send + Sync {
+/// For candle-based TA indicators (EMA, RSI, MACD, etc.)
+trait CandleIndicator: Send + Sync {
     fn name(&self) -> &str;
     fn update(&mut self, candle: &Candle);
-    fn value(&self) -> f64;        // raw indicator value
+    fn value(&self) -> f64;
     fn score(&self) -> f64;        // normalized [-1, +1]
-    fn ready(&self) -> bool;       // enough data accumulated
+    fn ready(&self) -> bool;
+}
+
+/// For Hyperliquid-native signal providers (HLP, liquidations, whales)
+trait HlSignalProvider: Send + Sync {
+    fn name(&self) -> &str;
+    fn update(&mut self, data: &MarketData);
+    fn score(&self) -> f64;        // normalized [-1, +1]
+    fn ready(&self) -> bool;
 }
 ```
 
-Adding a new indicator = implement one struct + register it in a factor group.
+Two separate traits: `CandleIndicator` for standard TA, `HlSignalProvider` for HL-native data that doesn't fit the candle model.
 
-## Module 3: RiskManager
+## Module 3: PaperExecutor
 
-### Pre-Trade Checks (before order placement)
+Paper-only in V1. This is the sole validation tool, so it must be realistic.
 
-| Rule | Default | Description |
-|------|---------|-------------|
-| `max_position_pct` | 5% | Single position max % of total capital |
-| `max_concurrent_positions` | 5 | Max simultaneous open positions |
-| `max_same_direction` | 3 | Max positions in same direction |
-| `max_daily_loss_pct` | 3% | Daily loss limit, pause new positions |
-| `max_drawdown_pct` | 10% | Total drawdown limit, close all + halt |
-| `min_signal_strength` | 0.6 | Minimum signal score to open |
-| `cooldown_after_loss` | 300s | No new position on same symbol after stop loss |
+### Fill Model
 
-### Post-Trade Monitors (while position is open)
+- Fill at latest trade price + **half spread** (estimated from L2 book snapshot)
+- Simulated slippage: configurable (default 0.05%)
+- Simulated fee: Hyperliquid taker rate (0.035%)
+- **Mark price** (not last price) for unrealized PnL calculation
+- Funding rate deduction every hour (1/8 of 8h rate, matching HL mechanics)
+- Respect min-notional and precision rules per symbol
+- **No private key required or loaded in paper mode**
 
-| Mechanism | Description |
-|-----------|-------------|
-| Fixed stop loss | Initial stop based on ATR at entry |
-| Trailing stop | Activates after profit reaches N x ATR, follows price |
-| Trailing take profit | Configurable fixed ratio or ATR-multiple partial TP |
-| Timeout close | Close if held > N hours with profit below threshold |
-| Global circuit breaker | Drawdown threshold -> close all -> Telegram alert -> halt engine |
+### Position Tracking
 
-### Risk Decision Structure
+- One position per symbol max (matching signal idempotency)
+- Track: entry price, size, direction, entry time, unrealized PnL, realized PnL
+- Simple stop loss: fixed ATR-based (configurable multiplier)
+- No trailing stop in V1 (keep it simple for validation)
 
-```rust
-enum RiskDecision {
-    Approved {
-        adjusted_size: f64,     // risk may reduce size
-        stop_loss: f64,
-        take_profit: Option<f64>,
-    },
-    Rejected {
-        reason: RiskRejectReason,
-    },
-}
+### Output
 
-enum RiskRejectReason {
-    MaxPositionsReached,
-    MaxDirectionExposure,
-    DailyLossLimitHit,
-    DrawdownBreached,
-    SignalTooWeak,
-    CooldownActive,
-}
-```
+All output to `tracing` structured logs (JSON to stdout):
+- Every signal generated (with all factor scores)
+- Every paper trade (open/close with PnL)
+- Running statistics: win rate, profit factor, total PnL, max drawdown
+- Periodic summary every N minutes (configurable)
 
-Every rejection is logged with reason for post-analysis.
-
-## Module 4: ExecutionEngine
-
-### Dual Mode via Trait
-
-```rust
-trait OrderExecutor: Send + Sync {
-    async fn place_order(&self, order: &Order) -> Result<OrderResult>;
-    async fn cancel_order(&self, order_id: &str) -> Result<()>;
-    async fn get_position(&self, symbol: &str) -> Result<Position>;
-    async fn get_balance(&self) -> Result<Balance>;
-}
-```
-
-Two implementations: `PaperExecutor` and `LiveExecutor`, switched via config.
-
-### PaperExecutor
-
-- Fills at latest trade price (not signal price)
-- Configurable simulated slippage (default 0.05%) and fees (Hyperliquid taker rate)
-- Simulates funding rate deductions every 8h
-- Same trade log format as LiveExecutor for comparison
-
-### LiveExecutor
-
-- Entry: limit order (signal price +/- slippage tolerance) -> timeout -> cancel and reprice or abandon (configurable)
-- Stop loss: Stop Market order placed on exchange **immediately** after entry fill (not dependent on local monitoring)
-- Take profit: limit order
-- Order status synced via WebSocket in real-time
-
-### State Reconciliation
-
-Every 60s:
-- Compare exchange positions vs local state
-- Mismatch -> trust exchange -> update local -> Telegram alert -> log anomaly
-
-## Module 5: PortfolioTracker
-
-### Components
-
-- **PositionManager**: Current open positions with all metadata
-- **PnLCalculator**: Real-time per-position and account-level PnL (realized / unrealized separated)
-- **EquityCurve**: Per-minute balance + unrealized PnL snapshots, real-time drawdown calculation, triggers RiskManager on threshold
-- **TradeJournal**: Full lifecycle of every trade (entry signal, factor scores, risk decision, fill price, close reason) persisted to PostgreSQL
-
-## Module 6: NotificationService
-
-### Three Channels
-
-| Channel | Purpose |
-|---------|---------|
-| Telegram Bot | Real-time alerts (open/close/warning/critical) |
-| Structured logs | JSON via `tracing`, daily rotation, stdout + file |
-| REST API + WebSocket | Real-time data feed for Dashboard |
-
-### Telegram Alert Levels
-
-| Level | Trigger |
-|-------|---------|
-| INFO | Position open/close |
-| WARN | Stop loss hit, daily loss approaching limit |
-| CRITICAL | Circuit breaker, WebSocket disconnected, state mismatch |
-
-## Module 7: REST API
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/status` | System status, uptime, mode |
-| `GET /api/positions` | Current positions |
-| `GET /api/pnl` | Account PnL, equity curve data |
-| `GET /api/signals` | Recent signals |
-| `GET /api/trades` | Historical trades (paginated) |
-| `GET /api/config` | Current configuration |
-| `PUT /api/config` | Hot-reload configuration (subset) |
-| `WebSocket /ws/live` | Real-time position/PnL/signal push |
-
-## Module 8: Configuration
+## Module 4: Configuration
 
 ### TOML Config File
 
-All parameters configurable: symbol watchlist, timeframe pairs, indicator parameters, factor weights, signal thresholds, risk limits, execution behavior, notification settings.
+```toml
+[general]
+mode = "paper"                  # only "paper" in V1
+log_level = "info"
 
-### Hot Reload
+[symbols]
+watchlist = ["BTC", "ETH", "SOL"]
+min_daily_volume = 1000000      # minimum daily volume in USD to trade
+# scan_all = false              # V2: scan all HL perps
 
-- File watcher via `notify` crate
-- Hot-reloadable: symbol watchlist, indicator params, risk params, signal thresholds
-- Requires restart: trading mode (paper/live), database connection, WebSocket URL
-- Every config change recorded to PostgreSQL with timestamp and diff
+[timeframes]
+trend = "4h"                    # higher TF for direction filter
+entry = "15m"                   # lower TF for entry signals
 
-### Secrets Management
+[indicators.trend]
+ema_short = 20
+ema_long = 50
+macd_fast = 12
+macd_slow = 26
+macd_signal = 9
+supertrend_period = 10
+supertrend_multiplier = 3.0
+weight = 0.25
 
-All secrets via environment variables (`.env` file), never in config or code:
-- `HYPERLIQUID_PRIVATE_KEY`
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
-- `DB_PASSWORD`
+[indicators.momentum]
+rsi_period = 14
+rsi_overbought = 70
+rsi_oversold = 30
+cci_period = 20
+weight = 0.15
 
-`.env` in `.gitignore`, `.env.example` provided as template.
+[indicators.volatility]
+atr_period = 14
+bollinger_period = 20
+bollinger_std = 2.0
+weight = 0.10
 
-## Module 9: Docker Deployment
+[indicators.hl_native]
+hlp_vault_address = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"
+whale_addresses = []            # manually curated list
+liquidation_lookback_secs = 300
+weight = 0.25
 
-```yaml
-services:
-  bot:
-    build: .
-    volumes:
-      - ./config:/config
-      - bot-data:/data
-    env_file: .env
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: unless-stopped
+[indicators.funding]
+funding_extreme_threshold = 0.01
+weight = 0.15
 
-  db:
-    image: postgres:16-alpine
-    volumes:
-      - pg-data:/var/lib/postgresql/data
-    environment:
-      POSTGRES_DB: hyperfun
-      POSTGRES_USER: bot
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U bot"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    restart: unless-stopped
+[indicators.mtf]
+weight = 0.10
 
-  dashboard:
-    build: ./dashboard
-    ports:
-      - "3000:3000"
-    environment:
-      - API_URL=http://bot:8080
-      - DATABASE_URL=postgresql://bot:${DB_PASSWORD}@db:5432/hyperfun
-    depends_on:
-      - bot
-      - db
-    restart: unless-stopped
+[signal]
+open_threshold = 0.6
+close_threshold = 0.2
 
-volumes:
-  pg-data:
-  bot-data:
+[paper]
+simulated_slippage_pct = 0.05
+simulated_fee_pct = 0.035
+position_size_usd = 1000       # fixed size per trade for paper
+atr_stop_multiplier = 2.0
+summary_interval_mins = 60
+
+[hyperliquid]
+ws_url = "wss://api.hyperliquid.xyz/ws"
+rest_url = "https://api.hyperliquid.xyz"
 ```
 
-## Project Structure: Rust Workspace
+### No Hot Reload in V1
+
+Restart the process to apply config changes. Hot reload adds complexity (invalidates warmup windows, factor scores, position state) and is not needed for a validation tool.
+
+### Secrets
+
+Paper mode requires NO secrets. `.env` with `HYPERLIQUID_PRIVATE_KEY` only needed for V2 live mode.
+
+## Project Structure
 
 ```
 hyperfun/
 ├── Cargo.toml                    # workspace root
 ├── config/
 │   └── default.toml
-├── .env.example
-├── docker-compose.yml
-├── Dockerfile
 ├── crates/
-│   ├── hyperfun-core/            # shared types + traits
-│   ├── hyperfun-market/          # market data engine
-│   ├── hyperfun-signal/          # signal engine + indicators
-│   ├── hyperfun-risk/            # risk management
-│   ├── hyperfun-execution/       # paper + live executors
-│   ├── hyperfun-portfolio/       # position tracking, PnL, journal
-│   ├── hyperfun-notify/          # telegram + logging
-│   └── hyperfun-api/             # REST API + WebSocket server
-├── src/
-│   └── main.rs                   # entry point, wires all modules
-└── dashboard/                    # TypeScript frontend
-    ├── package.json
-    └── src/
+│   ├── hyperfun-core/            # shared types, traits, config
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── types.rs          # Candle, MarketData, Signal, Order, Position
+│   │       ├── traits.rs         # CandleIndicator, HlSignalProvider
+│   │       └── config.rs         # config structs (serde)
+│   │
+│   ├── hyperfun-market/          # HL data engine
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── ws.rs             # WebSocket connection + reconnect
+│   │       ├── rest.rs           # REST client (backfill, funding, HLP, whales)
+│   │       ├── candle_store.rs   # ring buffer per symbol per TF
+│   │       └── hl_data.rs        # HLP vault, liquidations, whale tracking
+│   │
+│   ├── hyperfun-signal/          # signal engine
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── indicators/
+│   │       │   ├── mod.rs
+│   │       │   ├── ema.rs
+│   │       │   ├── macd.rs
+│   │       │   ├── supertrend.rs
+│   │       │   ├── rsi.rs
+│   │       │   ├── cci.rs
+│   │       │   ├── atr.rs
+│   │       │   └── bollinger.rs
+│   │       ├── hl_signals/
+│   │       │   ├── mod.rs
+│   │       │   ├── hlp_inventory.rs
+│   │       │   ├── liquidation.rs
+│   │       │   ├── whale_flow.rs
+│   │       │   └── funding.rs
+│   │       ├── factors.rs        # factor group scoring
+│   │       └── aggregator.rs     # weighted sum -> TradeSignal
+│   │
+│   └── hyperfun-executor/        # paper executor
+│       └── src/
+│           ├── lib.rs
+│           ├── paper.rs          # paper fill model
+│           ├── position.rs       # position tracking + PnL
+│           └── stats.rs          # running statistics
+│
+└── src/
+    └── main.rs                   # entry point, wires all crates
 ```
 
 ### Dependency Direction
 
-All crates depend only on `hyperfun-core`. No cross-dependencies between sibling crates. `main.rs` is the sole composition root.
+```
+hyperfun-core       (shared types + traits, no internal deps)
+    ^
+    |
+hyperfun-market     (depends on core)
+    ^
+    |
+hyperfun-signal     (depends on core)
+    ^
+    |
+hyperfun-executor   (depends on core)
+    ^
+    |
+main.rs             (depends on all, wires via channels)
+```
 
 ### Key Rust Dependencies
 
@@ -340,26 +319,71 @@ All crates depend only on `hyperfun-core`. No cross-dependencies between sibling
 | Async runtime | `tokio` |
 | WebSocket | `tokio-tungstenite` |
 | HTTP client | `reqwest` |
-| HTTP server | `axum` |
 | Serialization | `serde` + `serde_json` |
 | Configuration | `config` |
-| Database | `sqlx` (PostgreSQL) |
 | Logging | `tracing` + `tracing-subscriber` |
-| Telegram | `teloxide` |
-| File watcher | `notify` |
 
-## V1 Scope
+No `axum` (no HTTP server), no `sqlx` (no DB), no `teloxide` (no Telegram), no `notify` (no hot reload).
+
+## V1 Scope (Lean MVP)
 
 **In scope**:
-- All 9 modules above
-- Paper trading + live trading (config switch)
-- Multi-symbol scanning with configurable watchlist
-- Multi-timeframe signal generation
-- Full risk management suite
-- Telegram + logs + Dashboard + REST API
+- MarketDataEngine: HL WebSocket candles + REST backfill + HL-native data
+- SignalEngine: 6 factor groups (TA + HL-native), multi-timeframe, bar-close signals
+- PaperExecutor: realistic fills, position tracking, PnL, console output
+- Configuration: TOML config, no hot reload
+- Tests: unit + integration + property tests (see test plan)
 
-**Out of scope (V2+)**:
-- Backtesting engine
-- Python sidecar for advanced strategies
+**NOT in scope (V2+)**:
+- Live trading executor (requires private key, risk management)
+- Full risk management suite (max positions, drawdown, circuit breaker)
+- Backtesting engine (next priority after V1 validates signals)
+- Dashboard (TypeScript frontend)
+- Telegram notifications
+- PostgreSQL persistence
+- Docker deployment
+- REST API
+- Hot-reload configuration
+- Custom candle aggregation from trades
+- Trailing stop / partial take profit
 - Multi-account support
-- Web-based config editor
+
+## Warmup Behavior
+
+On startup:
+1. Connect to HL WebSocket, subscribe to candle streams for all symbols in watchlist
+2. REST backfill: fetch last 500 candles per symbol per timeframe
+3. Feed historical candles through all indicators to warm them up
+4. Begin live signal generation only after ALL indicator groups report `ready()`
+5. Log warmup duration and first signal timestamp
+
+Expected warmup for default config (EMA50 on 15m): ~500 * 15min = ~5 days of history, backfilled in seconds via REST.
+
+<!-- AUTONOMOUS DECISION LOG -->
+## Decision Audit Trail
+
+| # | Phase | Decision | Classification | Principle | Rationale | Rejected |
+|---|-------|----------|---------------|-----------|-----------|----------|
+| 1 | CEO | Mode: SELECTIVE EXPANSION | Mechanical | P1 | Standard mode | — |
+| 2 | CEO | Enable cross-project learnings | Mechanical | P1 | Completeness | — |
+| 3 | CEO | V1 scope: Lean MVP + HL signals | Premise (user) | — | User chose after dual-voice challenge | Full spec, backtesting V1 |
+| 4 | Eng | Use HL candles not custom aggregation | Mechanical | P5 | Hidden complexity | Custom aggregation |
+| 5 | Eng | All indicators in group must be ready | Mechanical | P5 | Partial readiness = wrong weights | Renormalize |
+| 6 | Eng | Two traits: CandleIndicator + HlSignalProvider | Mechanical | P5 | Candle-only trait doesn't fit HL data | Single trait |
+| 7 | Eng | Remove hot reload from MVP | Mechanical | P3 | Complexity trap | Keep hot reload |
+| 8 | Eng | Signals only on bar close | Mechanical | P5 | Prevents churn | Signal on tick |
+| 9 | Eng | Realistic paper fill model | Mechanical | P1 | Sole validation tool | Naive fills |
+| 10 | Eng | No private key in paper mode | Mechanical | P3 | Security | Always load key |
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/gstack-plan-ceo-review` | Scope & strategy | 1 | clean | 0/6 premises confirmed; scope reduced to lean MVP |
+| CEO Voices | `/gstack-autoplan` | Codex+subagent | 1 | clean | 0/6 consensus; both flagged premature infrastructure |
+| Eng Review | `/gstack-plan-eng-review` | Architecture & tests | 1 | clean | 11 issues found, all resolved |
+| Eng Voices | `/gstack-autoplan` | Codex+subagent | 1 | clean | 2/6 confirmed; 4 needed work |
+| Design Review | `/gstack-plan-design-review` | UI/UX gaps | 0 | skipped | No UI in lean MVP |
+| DX Review | `/gstack-plan-devex-review` | Developer experience | 0 | skipped | No dev-facing API in lean MVP |
+
+**VERDICT:** APPROVED. Lean MVP scope validated by CEO + Eng dual voices. All 11 engineering findings resolved in revised spec.
