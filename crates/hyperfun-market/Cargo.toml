@@ -13,3 +13,4 @@ reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 anyhow = { workspace = true }
+chrono = { workspace = true }

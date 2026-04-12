@@ -625,6 +625,7 @@ name = "hyperfun"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "config",
  "hyperfun-core",
  "hyperfun-executor",
@@ -663,6 +664,7 @@ name = "hyperfun-market"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "futures-util",
  "hyperfun-core",
  "reqwest",
