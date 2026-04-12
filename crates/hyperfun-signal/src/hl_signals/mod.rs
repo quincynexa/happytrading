@@ -1,1 +1,4 @@
-// HL-native signals stub - implementation in future tasks.
+pub mod hlp_inventory;
+pub mod liquidation;
+pub mod whale_flow;
+pub mod funding;
