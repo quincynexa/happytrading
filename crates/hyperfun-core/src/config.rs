@@ -151,8 +151,8 @@ mod tests {
         assert_eq!(app.indicators.trend.ema_short, 20);
         assert_eq!(app.indicators.trend.ema_long, 50);
         assert_eq!(app.indicators.momentum.rsi_period, 14);
-        assert!((app.signal.open_threshold - 0.6).abs() < f64::EPSILON);
-        assert!((app.signal.close_threshold - 0.2).abs() < f64::EPSILON);
+        assert!((app.signal.open_threshold - 0.35).abs() < f64::EPSILON);
+        assert!((app.signal.close_threshold - 0.12).abs() < f64::EPSILON);
         assert_eq!(app.paper.position_size_usd, 1000.0);
         assert_eq!(app.hyperliquid.ws_url, "wss://api.hyperliquid.xyz/ws");
     }

@@ -631,6 +631,8 @@ dependencies = [
  "hyperfun-executor",
  "hyperfun-market",
  "hyperfun-signal",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

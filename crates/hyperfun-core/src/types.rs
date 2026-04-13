@@ -15,6 +15,15 @@ impl Direction {
     }
 }
 
+impl std::fmt::Display for Direction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Direction::Long => write!(f, "Long"),
+            Direction::Short => write!(f, "Short"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candle {
     pub symbol: String,

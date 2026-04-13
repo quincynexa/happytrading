@@ -117,6 +117,9 @@ impl PaperExecutor {
     // ── public API ────────────────────────────────────────────────────────
 
     /// Process a signal action for the given symbol.
+    /// Returns `(Option<f64>, Option<f64>)`:
+    ///   - first: PnL from a close (flip or signal-close), if one occurred
+    ///   - second: fill price of a new open, if one occurred
     pub fn execute_signal(
         &mut self,
         action: SignalAction,
@@ -124,39 +127,46 @@ impl PaperExecutor {
         current_price: f64,
         atr: f64,
         timestamp: i64,
-    ) {
+    ) -> (Option<f64>, Option<f64>) {
         match action {
             SignalAction::Open(dir) => {
+                let mut close_pnl = None;
                 // If we're already in the opposite direction, flip.
                 let existing_dir = self.positions.get(symbol).map(|p| p.direction);
                 if let Some(ed) = existing_dir {
                     if ed != dir {
-                        self.close_position(symbol, current_price, "direction flip");
+                        close_pnl = self.close_position(symbol, current_price, "direction flip");
                     } else {
                         // Same direction: already open, nothing to do.
-                        return;
+                        return (None, None);
                     }
                 }
                 self.open_position(dir, symbol, current_price, atr, timestamp);
+                let fill = self.positions.get(symbol).map(|p| p.entry_price);
+                (close_pnl, fill)
             }
             SignalAction::Close => {
-                self.close_position(symbol, current_price, "signal close");
+                let pnl = self.close_position(symbol, current_price, "signal close");
+                (pnl, None)
             }
             SignalAction::Hold => {
-                // Nothing to do.
+                (None, None)
             }
         }
     }
 
     /// Check whether the stop-loss for `symbol` has been breached and close if so.
-    pub fn check_stop_losses(&mut self, symbol: &str, current_price: f64) {
+    /// Returns the realized PnL if a stop-loss was triggered.
+    pub fn check_stop_losses(&mut self, symbol: &str, current_price: f64) -> Option<f64> {
         let triggered = self
             .positions
             .get(symbol)
             .map_or(false, |p| p.should_stop_loss(current_price));
 
         if triggered {
-            self.close_position(symbol, current_price, "stop loss");
+            self.close_position(symbol, current_price, "stop loss")
+        } else {
+            None
         }
     }
 
