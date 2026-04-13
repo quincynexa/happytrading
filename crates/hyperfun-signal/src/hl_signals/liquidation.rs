@@ -5,15 +5,18 @@ use hyperfun_core::{Direction, HlSignalProvider, LiquidationData, MarketData};
 /// Tracks long vs short liquidation volume over a lookback window.
 /// Long liquidations (forced selling) = bullish signal.
 pub struct LiquidationSignal {
-    window_secs: i64,
+    window_ms: i64,
     events: VecDeque<LiquidationData>,
     ready: bool,
 }
 
 impl LiquidationSignal {
-    pub fn new(window_secs: i64) -> Self {
+    /// Create a new LiquidationSignal. `lookback_secs` is converted to
+    /// milliseconds internally to match the millisecond timestamps used
+    /// throughout the codebase.
+    pub fn new(lookback_secs: i64) -> Self {
         Self {
-            window_secs,
+            window_ms: lookback_secs * 1000,
             events: VecDeque::new(),
             ready: false,
         }
@@ -33,7 +36,7 @@ impl HlSignalProvider for LiquidationSignal {
 
     fn update(&mut self, data: &MarketData) {
         if let MarketData::Liquidation(liq) = data {
-            let cutoff = liq.timestamp - self.window_secs;
+            let cutoff = liq.timestamp - self.window_ms;
             // Prune stale entries
             while let Some(front) = self.events.front() {
                 if front.timestamp < cutoff {
@@ -88,8 +91,9 @@ mod tests {
     fn long_liquidations_are_bullish() {
         let mut signal = LiquidationSignal::new(300);
         // 5 long liquidations -> market absorbed forced selling -> bullish
+        // Use millisecond timestamps (window_ms = 300 * 1000 = 300_000)
         for i in 0..5 {
-            signal.update(&liq(Direction::Long, 100_000.0, 1_000 + i));
+            signal.update(&liq(Direction::Long, 100_000.0, 1_000_000 + i * 1000));
         }
         assert!(signal.ready());
         assert!(signal.score() > 0.0, "Long liquidations should be bullish (score > 0)");
@@ -99,7 +103,7 @@ mod tests {
     fn short_liquidations_are_bearish() {
         let mut signal = LiquidationSignal::new(300);
         for i in 0..5 {
-            signal.update(&liq(Direction::Short, 100_000.0, 1_000 + i));
+            signal.update(&liq(Direction::Short, 100_000.0, 1_000_000 + i * 1000));
         }
         assert!(signal.ready());
         assert!(signal.score() < 0.0, "Short liquidations should be bearish (score < 0)");
@@ -108,10 +112,10 @@ mod tests {
     #[test]
     fn stale_events_are_pruned() {
         let mut signal = LiquidationSignal::new(300);
-        // Old long liquidation at t=0
+        // Old long liquidation at t=0ms
         signal.update(&liq(Direction::Long, 1_000_000.0, 0));
-        // New short liquidation 400s later (past window)
-        signal.update(&liq(Direction::Short, 100.0, 400));
+        // New short liquidation 400s (400_000ms) later — past the 300s window
+        signal.update(&liq(Direction::Short, 100.0, 400_000));
         // The old long liq should be pruned; only recent short remains -> bearish
         assert!(signal.score() < 0.0, "Old events should be pruned");
     }
@@ -125,8 +129,18 @@ mod tests {
     #[test]
     fn score_clamped_to_one() {
         let mut signal = LiquidationSignal::new(300);
-        signal.update(&liq(Direction::Long, 1_000_000.0, 1_000));
+        signal.update(&liq(Direction::Long, 1_000_000.0, 1_000_000));
         // Only longs -> score should be exactly 1.0
         assert_eq!(signal.score(), 1.0);
+    }
+
+    #[test]
+    fn events_within_window_not_pruned() {
+        let mut signal = LiquidationSignal::new(300);
+        // Two events 100s (100_000ms) apart — both within the 300s window
+        signal.update(&liq(Direction::Long, 500_000.0, 1_000_000));
+        signal.update(&liq(Direction::Short, 500_000.0, 1_100_000));
+        // Both should be kept; equal long/short volume -> score ~ 0.0
+        assert!((signal.score()).abs() < 1e-9, "Equal volumes should cancel out");
     }
 }

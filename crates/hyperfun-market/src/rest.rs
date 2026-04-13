@@ -13,7 +13,11 @@ pub struct HlRestClient {
 impl HlRestClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .expect("failed to build HTTP client"),
             base_url: base_url.into(),
         }
     }
@@ -74,24 +78,9 @@ impl HlRestClient {
             let coin = pair[0].as_str().unwrap_or("").to_string();
             let venues = pair[1].as_array().ok_or_else(|| anyhow!("expected venues array"))?;
             for venue_pair in venues {
-                let vp = venue_pair.as_array().ok_or_else(|| anyhow!("expected [venue, data]"))?;
-                if vp.len() < 2 {
-                    continue;
+                if let Some(fd) = parse_funding_from_value(&coin, venue_pair) {
+                    result.push(fd);
                 }
-                let data = &vp[1];
-                let funding_rate = data["fundingRate"]
-                    .as_str()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                let next_funding_time = data["nextFundingTime"]
-                    .as_i64()
-                    .unwrap_or(0);
-                result.push(FundingData {
-                    symbol: coin.clone(),
-                    funding_rate,
-                    predicted_rate: funding_rate,
-                    timestamp: next_funding_time,
-                });
             }
         }
         Ok(result)
@@ -123,25 +112,12 @@ impl HlRestClient {
             let name = universe
                 .get(i)
                 .and_then(|u| u["name"].as_str())
-                .unwrap_or("")
-                .to_string();
+                .unwrap_or("");
 
-            let open_interest = ctx["openInterest"]
-                .as_str()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0);
-
-            let day_ntl_vlm = ctx["dayNtlVlm"]
-                .as_str()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0);
-
-            oi_data.push(OIData {
-                symbol: name.clone(),
-                open_interest,
-                timestamp: now,
-            });
-            vlm_data.push((name, day_ntl_vlm));
+            if let Some((oi, vlm)) = parse_asset_ctx(name, ctx, now) {
+                oi_data.push(oi);
+                vlm_data.push(vlm);
+            }
         }
 
         Ok((oi_data, vlm_data))
@@ -162,34 +138,17 @@ impl HlRestClient {
         let now = chrono::Utc::now().timestamp_millis();
         let mut result = Vec::new();
         for ap in asset_positions {
-            let pos = &ap["position"];
-            let coin = pos["coin"].as_str().unwrap_or("").to_string();
-            let position_size = pos["szi"]
-                .as_str()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0);
-            let entry_price = pos["entryPx"]
-                .as_str()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0);
-            let unrealized_pnl = pos["unrealizedPnl"]
-                .as_str()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0);
-            result.push(HlpData {
-                symbol: coin,
-                position_size,
-                entry_price,
-                unrealized_pnl,
-                timestamp: now,
-            });
+            if let Some(hlp) = parse_position(ap, now) {
+                result.push(hlp);
+            }
         }
         Ok(result)
     }
 }
 
 /// Parse a single HL candle JSON object into a `Candle`.
-/// Returns `None` if any required field is absent or unparseable.
+/// Returns `None` if any required field is absent or unparseable,
+/// or if float values are non-finite / logically invalid (high < low, close <= 0).
 pub(crate) fn parse_candle_from_value(v: &Value) -> Option<Candle> {
     // t / T are millisecond timestamps (numbers); s = symbol; i = interval
     // o, c, h, l, v are string-encoded floats; n is a number
@@ -204,6 +163,17 @@ pub(crate) fn parse_candle_from_value(v: &Value) -> Option<Candle> {
     let volume = v["v"].as_str()?.parse::<f64>().ok()?;
     let num_trades = v["n"].as_u64()?;
 
+    // Validate: all floats must be finite
+    if !open.is_finite() || !close.is_finite() || !high.is_finite()
+        || !low.is_finite() || !volume.is_finite()
+    {
+        return None;
+    }
+    // Validate: high >= low and close > 0
+    if high < low || close <= 0.0 {
+        return None;
+    }
+
     Some(Candle {
         symbol,
         interval,
@@ -215,6 +185,67 @@ pub(crate) fn parse_candle_from_value(v: &Value) -> Option<Candle> {
         close,
         volume,
         num_trades,
+    })
+}
+
+/// Parse a single element from the predictedFundings venue pair array.
+/// Input: `[venue, {fundingRate, nextFundingTime}]`
+pub(crate) fn parse_funding_from_value(coin: &str, venue_pair: &Value) -> Option<FundingData> {
+    let vp = venue_pair.as_array()?;
+    if vp.len() < 2 {
+        return None;
+    }
+    let data = &vp[1];
+    let funding_rate = data["fundingRate"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())?;
+    let next_funding_time = data["nextFundingTime"].as_i64()?;
+    Some(FundingData {
+        symbol: coin.to_string(),
+        funding_rate,
+        predicted_rate: funding_rate,
+        timestamp: next_funding_time,
+    })
+}
+
+/// Parse one asset context from metaAndAssetCtxs response.
+/// Returns `(OIData, (symbol, day_ntl_vlm))` or None if fields are missing.
+pub(crate) fn parse_asset_ctx(name: &str, ctx: &Value, now: i64) -> Option<(OIData, (String, f64))> {
+    let open_interest = ctx["openInterest"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())?;
+    let day_ntl_vlm = ctx["dayNtlVlm"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())?;
+    Some((
+        OIData {
+            symbol: name.to_string(),
+            open_interest,
+            timestamp: now,
+        },
+        (name.to_string(), day_ntl_vlm),
+    ))
+}
+
+/// Parse one position from clearinghouseState assetPositions array.
+pub(crate) fn parse_position(ap: &Value, now: i64) -> Option<HlpData> {
+    let pos = &ap["position"];
+    let coin = pos["coin"].as_str()?.to_string();
+    let position_size = pos["szi"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())?;
+    let entry_price = pos["entryPx"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())?;
+    let unrealized_pnl = pos["unrealizedPnl"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())?;
+    Some(HlpData {
+        symbol: coin,
+        position_size,
+        entry_price,
+        unrealized_pnl,
+        timestamp: now,
     })
 }
 
@@ -270,5 +301,175 @@ mod tests {
             "n": 4321u64
         });
         assert!(parse_candle_from_value(&v).is_none());
+    }
+
+    #[test]
+    fn test_parse_candle_high_less_than_low() {
+        let v = json!({
+            "t": 1700000000000i64,
+            "T": 1700000900000i64,
+            "s": "BTC",
+            "i": "15m",
+            "o": "29295.0",
+            "c": "29500.0",
+            "h": "29100.0",  // high < low
+            "l": "29200.0",
+            "v": "123.456",
+            "n": 4321u64
+        });
+        assert!(parse_candle_from_value(&v).is_none());
+    }
+
+    #[test]
+    fn test_parse_candle_close_zero() {
+        let v = json!({
+            "t": 1700000000000i64,
+            "T": 1700000900000i64,
+            "s": "BTC",
+            "i": "15m",
+            "o": "0.0",
+            "c": "0.0",      // close <= 0
+            "h": "1.0",
+            "l": "0.0",
+            "v": "0.0",
+            "n": 0u64
+        });
+        assert!(parse_candle_from_value(&v).is_none());
+    }
+
+    #[test]
+    fn test_parse_candle_infinity() {
+        let v = json!({
+            "t": 1700000000000i64,
+            "T": 1700000900000i64,
+            "s": "BTC",
+            "i": "15m",
+            "o": "inf",
+            "c": "29500.0",
+            "h": "29600.0",
+            "l": "29200.0",
+            "v": "123.456",
+            "n": 4321u64
+        });
+        assert!(parse_candle_from_value(&v).is_none());
+    }
+
+    // ── parse_funding_from_value tests ──────────────────────────────────
+
+    #[test]
+    fn test_parse_funding_valid() {
+        let venue_pair = json!(["Hyperliquid", {
+            "fundingRate": "0.0001",
+            "nextFundingTime": 1700001000000i64
+        }]);
+        let fd = parse_funding_from_value("BTC", &venue_pair).expect("should parse");
+        assert_eq!(fd.symbol, "BTC");
+        assert!((fd.funding_rate - 0.0001).abs() < 1e-12);
+        assert_eq!(fd.predicted_rate, fd.funding_rate);
+        assert_eq!(fd.timestamp, 1700001000000);
+    }
+
+    #[test]
+    fn test_parse_funding_missing_rate() {
+        let venue_pair = json!(["Hyperliquid", {
+            "nextFundingTime": 1700001000000i64
+        }]);
+        assert!(parse_funding_from_value("BTC", &venue_pair).is_none());
+    }
+
+    #[test]
+    fn test_parse_funding_malformed_not_array() {
+        let venue_pair = json!("garbage");
+        assert!(parse_funding_from_value("BTC", &venue_pair).is_none());
+    }
+
+    #[test]
+    fn test_parse_funding_short_array() {
+        let venue_pair = json!(["only_one"]);
+        assert!(parse_funding_from_value("BTC", &venue_pair).is_none());
+    }
+
+    // ── parse_asset_ctx tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_parse_asset_ctx_valid() {
+        let ctx = json!({
+            "openInterest": "12345.67",
+            "dayNtlVlm": "98765432.10"
+        });
+        let now = 1700000000000i64;
+        let (oi, vlm) = parse_asset_ctx("ETH", &ctx, now).expect("should parse");
+        assert_eq!(oi.symbol, "ETH");
+        assert!((oi.open_interest - 12345.67).abs() < 1e-9);
+        assert_eq!(oi.timestamp, now);
+        assert_eq!(vlm.0, "ETH");
+        assert!((vlm.1 - 98765432.10).abs() < 1e-2);
+    }
+
+    #[test]
+    fn test_parse_asset_ctx_missing_oi() {
+        let ctx = json!({
+            "dayNtlVlm": "1000.0"
+        });
+        assert!(parse_asset_ctx("ETH", &ctx, 0).is_none());
+    }
+
+    #[test]
+    fn test_parse_asset_ctx_missing_vlm() {
+        let ctx = json!({
+            "openInterest": "1000.0"
+        });
+        assert!(parse_asset_ctx("ETH", &ctx, 0).is_none());
+    }
+
+    // ── parse_position tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_position_valid() {
+        let ap = json!({
+            "position": {
+                "coin": "BTC",
+                "szi": "-1.5",
+                "entryPx": "50000.0",
+                "unrealizedPnl": "-200.5"
+            }
+        });
+        let now = 1700000000000i64;
+        let hlp = parse_position(&ap, now).expect("should parse");
+        assert_eq!(hlp.symbol, "BTC");
+        assert!((hlp.position_size - (-1.5)).abs() < 1e-9);
+        assert!((hlp.entry_price - 50000.0).abs() < 1e-9);
+        assert!((hlp.unrealized_pnl - (-200.5)).abs() < 1e-9);
+        assert_eq!(hlp.timestamp, now);
+    }
+
+    #[test]
+    fn test_parse_position_missing_coin() {
+        let ap = json!({
+            "position": {
+                "szi": "1.0",
+                "entryPx": "50000.0",
+                "unrealizedPnl": "0.0"
+            }
+        });
+        assert!(parse_position(&ap, 0).is_none());
+    }
+
+    #[test]
+    fn test_parse_position_missing_szi() {
+        let ap = json!({
+            "position": {
+                "coin": "BTC",
+                "entryPx": "50000.0",
+                "unrealizedPnl": "0.0"
+            }
+        });
+        assert!(parse_position(&ap, 0).is_none());
+    }
+
+    #[test]
+    fn test_parse_position_no_position_key() {
+        let ap = json!({ "other": "stuff" });
+        assert!(parse_position(&ap, 0).is_none());
     }
 }

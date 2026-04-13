@@ -41,14 +41,27 @@ impl CandleIndicator for Supertrend {
     fn update(&mut self, candle: &Candle) {
         self.count += 1;
 
-        let data_item = ta::DataItem::builder()
-            .high(candle.high)
-            .low(candle.low)
+        // Defensive clamping: ensure OHLCV values satisfy DataItem constraints
+        // (high >= open/close, low <= open/close). Same pattern as ATR indicator.
+        let high = candle.high.max(candle.open).max(candle.close);
+        let low = candle.low.min(candle.open).min(candle.close).max(0.0);
+        let volume = candle.volume.max(0.0);
+
+        let data_item = match ta::DataItem::builder()
+            .high(high)
+            .low(low)
             .close(candle.close)
             .open(candle.open)
-            .volume(candle.volume)
+            .volume(volume)
             .build()
-            .unwrap();
+        {
+            Ok(item) => item,
+            Err(_) => {
+                // Malformed candle data — skip this update entirely.
+                self.count -= 1;
+                return;
+            }
+        };
 
         let atr_val = self.atr.next(&data_item);
 
@@ -191,5 +204,17 @@ mod tests {
             st.update(&make_candle(100.0, 101.0, 99.0, 100.5));
         }
         assert_eq!(st.score(), 0.0);
+    }
+
+    #[test]
+    fn malformed_candle_does_not_panic() {
+        let mut st = Supertrend::new(7, 3.0);
+        // high < low — previously would have panicked
+        st.update(&make_candle(100.0, 95.0, 105.0, 100.0));
+        // Negative prices
+        st.update(&make_candle(-10.0, -5.0, -15.0, -10.0));
+        // Should not panic and should not have advanced count
+        // (both candles are clamped/handled gracefully)
+        assert!(!st.ready());
     }
 }
