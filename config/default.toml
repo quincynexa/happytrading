@@ -44,7 +44,7 @@ funding_extreme_threshold = 0.01
 weight = 0.15
 
 [indicators.mtf]
-weight = 0.10
+weight = 0.0  # MTF is a hard filter, not a scored group
 
 [signal]
 open_threshold = 0.6

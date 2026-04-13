@@ -75,6 +75,9 @@ impl SymbolState {
         let atr_for_stop = Atr::new(vc.atr_period as usize);
 
         let hlp_signal = HlpInventorySignal::new();
+        // V1 limitation: LiquidationSignal has no data source (requires WS subscription
+        // for liquidation events, not implemented yet). Excluded from HL-native group
+        // readiness check. Will always report ready()=false and score()=0.0.
         let liquidation_signal = LiquidationSignal::new(
             config.indicators.hl_native.liquidation_lookback_secs as i64,
         );
@@ -308,25 +311,10 @@ async fn main() -> Result<()> {
                 }
 
                 // Compute composite score using this symbol's indicators
-                let hl_native_score = if state.hlp_signal.ready()
-                    || state.liquidation_signal.ready()
-                    || state.whale_signal.ready()
-                {
-                    let mut sum = 0.0f64;
-                    let mut n = 0u32;
-                    if state.hlp_signal.ready() {
-                        sum += state.hlp_signal.score();
-                        n += 1;
-                    }
-                    if state.liquidation_signal.ready() {
-                        sum += state.liquidation_signal.score();
-                        n += 1;
-                    }
-                    if state.whale_signal.ready() {
-                        sum += state.whale_signal.score();
-                        n += 1;
-                    }
-                    Some(sum / n as f64)
+                // V1: liquidation signal excluded from readiness check (no data source yet)
+                let hl_native_score = if state.hlp_signal.ready() && state.whale_signal.ready() {
+                    let avg = (state.hlp_signal.score() + state.whale_signal.score()) / 2.0;
+                    Some(avg)
                 } else {
                     None
                 };
