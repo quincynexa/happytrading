@@ -119,6 +119,8 @@ pub struct Position {
     pub realized_pnl: f64,
     pub fees_paid: f64,
     pub funding_paid: f64,
+    /// Best price seen since entry (highest for Long, lowest for Short).
+    pub extreme_price: f64,
 }
 
 impl Position {
@@ -142,6 +144,7 @@ impl Position {
             realized_pnl: 0.0,
             fees_paid: 0.0,
             funding_paid: 0.0,
+            extreme_price: entry_price,
         }
     }
 
@@ -167,6 +170,42 @@ impl Position {
         self.realized_pnl = pnl;
         self.unrealized_pnl = 0.0;
         pnl
+    }
+
+    /// Update the trailing stop if conditions are met.
+    /// `activation_atr` — profit in ATR units needed to activate trailing.
+    /// `distance_atr` — how far behind the extreme price the stop trails.
+    /// `atr` — current ATR value.
+    pub fn update_trailing_stop(&mut self, current_price: f64, atr: f64, activation_atr: f64, distance_atr: f64) {
+        if atr <= 0.0 {
+            return;
+        }
+        match self.direction {
+            Direction::Long => {
+                if current_price > self.extreme_price {
+                    self.extreme_price = current_price;
+                }
+                let profit_atr = (self.extreme_price - self.entry_price) / atr;
+                if profit_atr >= activation_atr {
+                    let trailing = self.extreme_price - distance_atr * atr;
+                    if trailing > self.stop_loss {
+                        self.stop_loss = trailing;
+                    }
+                }
+            }
+            Direction::Short => {
+                if current_price < self.extreme_price {
+                    self.extreme_price = current_price;
+                }
+                let profit_atr = (self.entry_price - self.extreme_price) / atr;
+                if profit_atr >= activation_atr {
+                    let trailing = self.extreme_price + distance_atr * atr;
+                    if trailing < self.stop_loss {
+                        self.stop_loss = trailing;
+                    }
+                }
+            }
+        }
     }
 
     /// Return `true` when the current price has breached the stop-loss level.

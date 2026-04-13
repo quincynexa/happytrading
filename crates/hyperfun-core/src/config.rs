@@ -91,6 +91,7 @@ pub struct MtfConfig {
 pub struct SignalConfig {
     pub open_threshold: f64,
     pub close_threshold: f64,
+    pub cooldown_bars: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +100,8 @@ pub struct PaperConfig {
     pub simulated_fee_pct: f64,
     pub position_size_usd: f64,
     pub atr_stop_multiplier: f64,
+    pub trailing_stop_activation_atr: f64,
+    pub trailing_stop_distance_atr: f64,
     pub summary_interval_mins: u64,
 }
 

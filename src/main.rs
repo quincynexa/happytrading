@@ -138,6 +138,7 @@ async fn main() -> Result<()> {
     let mut aggregator = SignalAggregator::new(
         config.signal.open_threshold,
         config.signal.close_threshold,
+        config.signal.cooldown_bars,
     );
 
     // ── 6. Create PaperExecutor ──────────────────────────────────────────
@@ -146,6 +147,8 @@ async fn main() -> Result<()> {
         config.paper.simulated_fee_pct,
         config.paper.position_size_usd,
         config.paper.atr_stop_multiplier,
+        config.paper.trailing_stop_activation_atr,
+        config.paper.trailing_stop_distance_atr,
     );
 
     // ── 6b. Create JournalWriter (JSONL output to data/) ──────────────
@@ -360,9 +363,16 @@ async fn main() -> Result<()> {
 
                 bar_close_count += 1;
 
-                // Check stop losses on bar-close price (not mid-bar wicks)
+                // Look up this symbol's state (needed for ATR in stop-loss check)
+                let state = match symbol_states.get_mut(&symbol) {
+                    Some(s) => s,
+                    None => continue, // unknown symbol, skip
+                };
+
+                // Check stop losses on bar-close price (with trailing stop update)
+                let current_atr_for_stop = state.atr_for_stop.atr_value();
                 let stop_dir = executor.get_position(&symbol).map(|p| p.direction);
-                if let Some(stop_pnl) = executor.check_stop_losses(&symbol, closed_price) {
+                if let Some(stop_pnl) = executor.check_stop_losses(&symbol, closed_price, current_atr_for_stop) {
                     let dir_str = match stop_dir {
                         Some(Direction::Long) => "Long",
                         Some(Direction::Short) => "Short",
@@ -376,7 +386,7 @@ async fn main() -> Result<()> {
                         price: closed_price,
                         fill_price: closed_price,
                         composite: 0.0,
-                        atr: 0.0,
+                        atr: current_atr_for_stop,
                         stop_loss: None,
                         pnl: Some(stop_pnl),
                         reason: Some("stop_loss".into()),
@@ -385,12 +395,6 @@ async fn main() -> Result<()> {
                 if !executor.has_position(&symbol) {
                     aggregator.clear_position(&symbol);
                 }
-
-                // Look up this symbol's state
-                let state = match symbol_states.get_mut(&symbol) {
-                    Some(s) => s,
-                    None => continue, // unknown symbol, skip
-                };
 
                 // Update indicators with the CLOSED bar (not the new bar's first tick)
                 state.trend_group.update_all(&closed);

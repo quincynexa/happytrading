@@ -14,6 +14,8 @@ pub struct PaperExecutor {
     fee_pct: f64,
     position_size_usd: f64,
     atr_stop_multiplier: f64,
+    trailing_activation_atr: f64,
+    trailing_distance_atr: f64,
 }
 
 impl PaperExecutor {
@@ -23,11 +25,15 @@ impl PaperExecutor {
     /// * `fee_pct`      – one-way trading fee as a percentage of notional (e.g. `0.035`)
     /// * `position_size_usd` – fixed notional in USD for every trade
     /// * `atr_stop_multiplier` – how many ATRs away the stop-loss is set
+    /// * `trailing_activation_atr` – profit in ATR units to activate trailing stop
+    /// * `trailing_distance_atr` – trailing stop distance in ATR units
     pub fn new(
         slippage_pct: f64,
         fee_pct: f64,
         position_size_usd: f64,
         atr_stop_multiplier: f64,
+        trailing_activation_atr: f64,
+        trailing_distance_atr: f64,
     ) -> Self {
         Self {
             positions: HashMap::new(),
@@ -36,6 +42,8 @@ impl PaperExecutor {
             fee_pct,
             position_size_usd,
             atr_stop_multiplier,
+            trailing_activation_atr,
+            trailing_distance_atr,
         }
     }
 
@@ -155,16 +163,40 @@ impl PaperExecutor {
         }
     }
 
-    /// Check whether the stop-loss for `symbol` has been breached and close if so.
-    /// Returns the realized PnL if a stop-loss was triggered.
-    pub fn check_stop_losses(&mut self, symbol: &str, current_price: f64) -> Option<f64> {
+    /// Update trailing stop and check whether the stop-loss has been breached.
+    /// Returns the realized PnL if a stop was triggered.
+    pub fn check_stop_losses(&mut self, symbol: &str, current_price: f64, atr: f64) -> Option<f64> {
+        // Update trailing stop before checking
+        if let Some(pos) = self.positions.get_mut(symbol) {
+            pos.update_trailing_stop(
+                current_price,
+                atr,
+                self.trailing_activation_atr,
+                self.trailing_distance_atr,
+            );
+        }
+
         let triggered = self
             .positions
             .get(symbol)
             .map_or(false, |p| p.should_stop_loss(current_price));
 
         if triggered {
-            self.close_position(symbol, current_price, "stop loss")
+            let reason = if self.positions.get(symbol)
+                .map_or(false, |p| {
+                    let profit = match p.direction {
+                        Direction::Long => current_price - p.entry_price,
+                        Direction::Short => p.entry_price - current_price,
+                    };
+                    // If we're closing at a profit relative to entry, it was a trailing stop
+                    profit > 0.0
+                })
+            {
+                "trailing stop"
+            } else {
+                "stop loss"
+            };
+            self.close_position(symbol, current_price, reason)
         } else {
             None
         }
@@ -199,8 +231,8 @@ mod tests {
     use hyperfun_core::{Direction, SignalAction};
 
     fn make_executor() -> PaperExecutor {
-        // slippage 0.05%, fee 0.035%, size $1 000, 2x ATR stop
-        PaperExecutor::new(0.05, 0.035, 1_000.0, 2.0)
+        // slippage 0.05%, fee 0.035%, size $1 000, 2x ATR stop, trailing 1.5/1.5
+        PaperExecutor::new(0.05, 0.035, 1_000.0, 2.0, 1.5, 1.5)
     }
 
     #[test]
@@ -252,12 +284,41 @@ mod tests {
         let stop = ex.get_position("BTC").unwrap().stop_loss;
 
         // Price above stop: position still open
-        ex.check_stop_losses("BTC", stop + 100.0);
+        ex.check_stop_losses("BTC", stop + 100.0, 500.0);
         assert!(ex.has_position("BTC"));
 
         // Price at/below stop: position closes
-        ex.check_stop_losses("BTC", stop - 1.0);
+        ex.check_stop_losses("BTC", stop - 1.0, 500.0);
         assert!(!ex.has_position("BTC"));
         assert_eq!(ex.stats().total_trades, 1);
+    }
+
+    #[test]
+    fn trailing_stop_locks_profit() {
+        let mut ex = make_executor();
+
+        // Open long at $50 000, ATR = $500
+        // Initial stop = 50025 - 1000 = 49025
+        ex.execute_signal(SignalAction::Open(Direction::Long), "BTC", 50_000.0, 500.0, 0);
+        let initial_stop = ex.get_position("BTC").unwrap().stop_loss;
+
+        // Price moves to $50 800 — profit = 1.55 ATR (> 1.5 activation)
+        // Trailing stop should activate: 50800 - 1.5*500 = 50050
+        ex.check_stop_losses("BTC", 50_800.0, 500.0);
+        assert!(ex.has_position("BTC"));
+        let new_stop = ex.get_position("BTC").unwrap().stop_loss;
+        assert!(new_stop > initial_stop, "trailing stop should have moved up: {} > {}", new_stop, initial_stop);
+
+        // Price continues to $51 500 — trailing moves up further
+        ex.check_stop_losses("BTC", 51_500.0, 500.0);
+        assert!(ex.has_position("BTC"));
+        let higher_stop = ex.get_position("BTC").unwrap().stop_loss;
+        assert!(higher_stop > new_stop);
+
+        // Price drops back to trailing stop level — should trigger
+        ex.check_stop_losses("BTC", higher_stop - 1.0, 500.0);
+        assert!(!ex.has_position("BTC"));
+        // It was profitable — trailing stop, not initial stop
+        assert!(ex.stats().total_pnl > 0.0);
     }
 }

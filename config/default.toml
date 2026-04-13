@@ -49,12 +49,15 @@ weight = 0.0  # MTF is a hard filter, not a scored group
 [signal]
 open_threshold = 0.35
 close_threshold = 0.12
+cooldown_bars = 3
 
 [paper]
 simulated_slippage_pct = 0.05
 simulated_fee_pct = 0.035
 position_size_usd = 1000
 atr_stop_multiplier = 2.0
+trailing_stop_activation_atr = 1.5
+trailing_stop_distance_atr = 1.5
 summary_interval_mins = 60
 
 [hyperliquid]
