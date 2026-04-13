@@ -40,7 +40,7 @@ liquidation_lookback_secs = 300
 weight = 0.25
 
 [indicators.funding]
-funding_extreme_threshold = 0.01
+funding_extreme_threshold = 0.001
 weight = 0.15
 
 [indicators.mtf]

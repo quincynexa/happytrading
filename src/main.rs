@@ -289,9 +289,10 @@ async fn main() -> Result<()> {
     let funding_weight = config.indicators.funding.weight;
     let trend_tf = config.timeframes.trend.clone();
 
-    // Bar-close detection: track last open_time per (symbol, interval).
-    // When open_time changes, the previous bar has closed and a new one started.
-    let mut last_open_time: HashMap<(String, String), i64> = HashMap::new();
+    // Bar-close detection: buffer the latest candle per (symbol, interval).
+    // When open_time changes, the buffered candle is the final state of the
+    // closed bar — push it to CandleStore and feed it to indicators.
+    let mut last_candle: HashMap<(String, String), Candle> = HashMap::new();
 
     // Observability counters
     let mut mid_bar_count: u64 = 0;
@@ -304,23 +305,26 @@ async fn main() -> Result<()> {
                 let symbol = candle.symbol.clone();
                 let interval = candle.interval.clone();
                 let price = candle.close;
-                let timestamp = candle.close_time;
 
                 // ── Bar-close detection ─────────────────────────────────────
                 // Hyperliquid WS pushes mid-bar updates on every trade.
-                // A bar is "closed" when the open_time changes for the same
-                // (symbol, interval) — the new open_time means a new bar started,
-                // so the previous bar is final.
+                // When open_time changes for the same (symbol, interval),
+                // the buffered candle is the closed bar's final state.
                 let bar_key = (symbol.clone(), interval.clone());
-                let prev_open_time = last_open_time.get(&bar_key).copied();
-                let is_bar_close = match prev_open_time {
-                    Some(prev) => candle.open_time != prev,
-                    None => false, // First candle for this key — no closed bar yet
+                let prev = last_candle.get(&bar_key);
+                let closed_bar = match prev {
+                    Some(prev_candle) if candle.open_time != prev_candle.open_time => {
+                        Some(prev_candle.clone())
+                    }
+                    _ => None,
                 };
-                last_open_time.insert(bar_key, candle.open_time);
+                // Always update the buffer with the latest tick
+                last_candle.insert(bar_key, candle.clone());
 
-                // Store in CandleStore (always, even mid-bar — needed for stop-loss checks)
-                engine.candle_store_mut().push(candle.clone());
+                // If a bar closed, push the CLOSED bar (not the new tick) to CandleStore
+                if let Some(ref closed) = closed_bar {
+                    engine.candle_store_mut().push(closed.clone());
+                }
 
                 // Skip signal generation while candle store is stale (e.g. during backfill)
                 if engine.candle_store().is_stale() {
@@ -335,7 +339,7 @@ async fn main() -> Result<()> {
                 // ── Mid-bar: only update unrealized PnL, skip everything else ──
                 // Stop-loss is checked on bar-close only to avoid being
                 // stopped out by intra-bar wicks/noise.
-                if !is_bar_close {
+                if closed_bar.is_none() {
                     mid_bar_count += 1;
                     executor.update_unrealized_pnl(&symbol, price);
                     debug!(
@@ -348,23 +352,29 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
+                // The closed bar is the one we feed to indicators and use for
+                // stop-loss / signal evaluation — NOT the new bar's first tick.
+                let closed = closed_bar.unwrap();
+                let closed_price = closed.close;
+                let closed_ts = closed.close_time;
+
                 bar_close_count += 1;
 
                 // Check stop losses on bar-close price (not mid-bar wicks)
                 let stop_dir = executor.get_position(&symbol).map(|p| p.direction);
-                if let Some(stop_pnl) = executor.check_stop_losses(&symbol, price) {
+                if let Some(stop_pnl) = executor.check_stop_losses(&symbol, closed_price) {
                     let dir_str = match stop_dir {
                         Some(Direction::Long) => "Long",
                         Some(Direction::Short) => "Short",
                         None => "Unknown",
                     };
                     journal.write_trade(&TradeRecord {
-                        ts: timestamp,
+                        ts: closed_ts,
                         symbol: symbol.clone(),
                         event: "close".into(),
                         direction: dir_str.into(),
-                        price,
-                        fill_price: price,
+                        price: closed_price,
+                        fill_price: closed_price,
                         composite: 0.0,
                         atr: 0.0,
                         stop_loss: None,
@@ -382,11 +392,11 @@ async fn main() -> Result<()> {
                     None => continue, // unknown symbol, skip
                 };
 
-                // Update indicators with this symbol's closed bar
-                state.trend_group.update_all(&candle);
-                state.momentum_group.update_all(&candle);
-                state.volatility_group.update_all(&candle);
-                state.atr_for_stop.update(&candle);
+                // Update indicators with the CLOSED bar (not the new bar's first tick)
+                state.trend_group.update_all(&closed);
+                state.momentum_group.update_all(&closed);
+                state.volatility_group.update_all(&closed);
+                state.atr_for_stop.update(&closed);
 
                 // Compute composite score using this symbol's indicators
                 // hl_native readiness: HLP is always required; whale is only
@@ -432,8 +442,8 @@ async fn main() -> Result<()> {
                 info!(
                     symbol = %symbol,
                     bar_close_count,
-                    open_time = candle.open_time,
-                    close_price = price,
+                    open_time = closed.open_time,
+                    close_price = closed_price,
                     composite = format!("{:.4}", composite_score),
                     trend = format!("{:?}", trend_score),
                     momentum = format!("{:?}", momentum_score),
@@ -480,10 +490,10 @@ async fn main() -> Result<()> {
 
                 // ── Journal: write bar-close score record ───────────────────
                 journal.write_score(&BarScoreRecord {
-                    ts: timestamp,
+                    ts: closed_ts,
                     symbol: symbol.clone(),
-                    open_time: candle.open_time,
-                    close_price: price,
+                    open_time: closed.open_time,
+                    close_price: closed_price,
                     composite: composite_score,
                     trend: trend_score,
                     momentum: momentum_score,
@@ -509,17 +519,17 @@ async fn main() -> Result<()> {
                             signal_count,
                             "signal: OPEN"
                         );
-                        let (close_pnl, fill) = executor.execute_signal(action, &symbol, price, current_atr, timestamp);
+                        let (close_pnl, fill) = executor.execute_signal(action, &symbol, closed_price, current_atr, closed_ts);
 
                         // Journal: record flip-close if there was one
                         if let Some(pnl) = close_pnl {
                             journal.write_trade(&TradeRecord {
-                                ts: timestamp,
+                                ts: closed_ts,
                                 symbol: symbol.clone(),
                                 event: "close".into(),
                                 direction: dir.opposite().to_string(),
-                                price,
-                                fill_price: price,
+                                price: closed_price,
+                                fill_price: closed_price,
                                 composite: composite_score,
                                 atr: current_atr,
                                 stop_loss: None,
@@ -531,12 +541,12 @@ async fn main() -> Result<()> {
                         // Journal: record open
                         let stop = executor.get_position(&symbol).map(|p| p.stop_loss);
                         journal.write_trade(&TradeRecord {
-                            ts: timestamp,
+                            ts: closed_ts,
                             symbol: symbol.clone(),
                             event: "open".into(),
                             direction: dir_str.into(),
-                            price,
-                            fill_price: fill.unwrap_or(price),
+                            price: closed_price,
+                            fill_price: fill.unwrap_or(closed_price),
                             composite: composite_score,
                             atr: current_atr,
                             stop_loss: stop,
@@ -560,16 +570,16 @@ async fn main() -> Result<()> {
                             signal_count,
                             "signal: CLOSE"
                         );
-                        let (pnl, _) = executor.execute_signal(action, &symbol, price, current_atr, timestamp);
+                        let (pnl, _) = executor.execute_signal(action, &symbol, closed_price, current_atr, closed_ts);
 
                         // Journal: record close
                         journal.write_trade(&TradeRecord {
-                            ts: timestamp,
+                            ts: closed_ts,
                             symbol: symbol.clone(),
                             event: "close".into(),
                             direction: dir_str.into(),
-                            price,
-                            fill_price: price,
+                            price: closed_price,
+                            fill_price: closed_price,
                             composite: composite_score,
                             atr: current_atr,
                             stop_loss: None,
@@ -581,12 +591,12 @@ async fn main() -> Result<()> {
                     }
                     SignalAction::Hold => {
                         // Update unrealized PnL
-                        executor.update_unrealized_pnl(&symbol, price);
+                        executor.update_unrealized_pnl(&symbol, closed_price);
                     }
                 }
 
                 // Log stats periodically
-                if timestamp - last_summary_ts >= summary_interval_ms {
+                if closed_ts - last_summary_ts >= summary_interval_ms {
                     let stats = executor.stats();
                     info!(
                         total_trades = stats.total_trades,
@@ -601,7 +611,7 @@ async fn main() -> Result<()> {
                         signal_count,
                         "periodic summary"
                     );
-                    last_summary_ts = timestamp;
+                    last_summary_ts = closed_ts;
                 }
             }
             Some(market_data) = md_rx.recv() => {

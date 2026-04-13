@@ -19,25 +19,32 @@ impl SignalAggregator {
     /// Compute a weighted composite score from factor group scores.
     ///
     /// Each entry is (group_name, weight, Option<score>).
-    /// Groups with None score contribute 0 to the weighted sum.
-    /// Weights are NOT renormalized — the composite is simply the
-    /// weighted sum (all group weights should sum to ~1.0).
+    /// Groups with `None` score are excluded entirely. Weights of the
+    /// remaining (ready) groups are **renormalized** so they sum to 1.0,
+    /// ensuring the composite stays in [-1, 1] regardless of how many
+    /// groups are ready.
     /// Returns (composite_score, detail_vec).
     pub fn compute_score(
         &self,
         factor_scores: &[(&str, f64, Option<f64>)],
     ) -> (f64, Vec<(String, f64)>) {
         let mut weighted_sum = 0.0;
+        let mut total_weight = 0.0;
         let mut details = Vec::new();
 
         for (name, weight, score_opt) in factor_scores {
             if let Some(score) = score_opt {
                 weighted_sum += weight * score;
+                total_weight += weight;
                 details.push((name.to_string(), *score));
             }
         }
 
-        let composite = if details.is_empty() { 0.0 } else { weighted_sum };
+        let composite = if total_weight > 0.0 {
+            weighted_sum / total_weight
+        } else {
+            0.0
+        };
 
         (composite, details)
     }
@@ -102,7 +109,7 @@ mod tests {
     fn test_compute_score_weights() {
         let agg = SignalAggregator::new(0.6, 0.2);
         // Group A: weight 2.0, score 0.8
-        // Group B: weight 1.0, score None (excluded, contributes 0)
+        // Group B: weight 1.0, score None (excluded entirely)
         // Group C: weight 1.0, score 0.4
         let factors = [
             ("trend", 2.0, Some(0.8f64)),
@@ -111,8 +118,9 @@ mod tests {
         ];
         let (composite, details) = agg.compute_score(&factors);
         // weighted_sum = 2.0*0.8 + 1.0*0.4 = 2.0
-        // Weights are NOT renormalized — composite is the raw weighted sum.
-        let expected = 2.0 * 0.8 + 1.0 * 0.4;
+        // total_weight = 2.0 + 1.0 = 3.0
+        // composite = 2.0 / 3.0 ≈ 0.6667
+        let expected = (2.0 * 0.8 + 1.0 * 0.4) / (2.0 + 1.0);
         assert!((composite - expected).abs() < 1e-9, "composite={} expected={}", composite, expected);
         assert_eq!(details.len(), 2, "only 2 groups with scores should be in details");
     }
