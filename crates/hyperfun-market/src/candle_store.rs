@@ -1,9 +1,10 @@
 use hyperfun_core::Candle;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 
 pub struct CandleStore {
     capacity: usize,
-    store: HashMap<(String, String), Vec<Candle>>,
+    store: HashMap<(String, String), VecDeque<Candle>>,
     stale: bool,
 }
 
@@ -14,20 +15,23 @@ impl CandleStore {
 
     pub fn push(&mut self, candle: Candle) {
         let key = (candle.symbol.clone(), candle.interval.clone());
-        let buf = self.store.entry(key).or_insert_with(Vec::new);
-        if buf.len() >= self.capacity { buf.remove(0); }
-        buf.push(candle);
+        let buf = self.store.entry(key).or_insert_with(VecDeque::new);
+        if buf.len() >= self.capacity { buf.pop_front(); }
+        buf.push_back(candle);
     }
 
     pub fn get_last_n(&self, symbol: &str, interval: &str, n: usize) -> Vec<&Candle> {
         self.store
             .get(&(symbol.to_string(), interval.to_string()))
-            .map(|buf| { let start = buf.len().saturating_sub(n); buf[start..].iter().collect() })
+            .map(|buf| {
+                let start = buf.len().saturating_sub(n);
+                buf.iter().skip(start).collect()
+            })
             .unwrap_or_default()
     }
 
     pub fn last(&self, symbol: &str, interval: &str) -> Option<&Candle> {
-        self.store.get(&(symbol.to_string(), interval.to_string())).and_then(|buf| buf.last())
+        self.store.get(&(symbol.to_string(), interval.to_string())).and_then(|buf| buf.back())
     }
 
     pub fn len(&self, symbol: &str, interval: &str) -> usize {

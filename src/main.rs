@@ -214,7 +214,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Whale position poller (every 30s) — polls each configured whale address
+    // Whale position poller (every 60s per spec) — polls each configured whale address
     if !config.indicators.hl_native.whale_addresses.is_empty() {
         let md_tx_whale = md_tx.clone();
         let rest_url = config.hyperliquid.rest_url.clone();
@@ -240,7 +240,7 @@ async fn main() -> Result<()> {
                         Err(e) => tracing::warn!(address = %address, error = %e, "whale poll failed"),
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
         });
     }
@@ -286,6 +286,11 @@ async fn main() -> Result<()> {
 
                 // Store in CandleStore
                 engine.candle_store_mut().push(candle.clone());
+
+                // Skip signal generation while candle store is stale (e.g. during backfill)
+                if engine.candle_store().is_stale() {
+                    continue;
+                }
 
                 // Only process entry-timeframe candles for signal decisions
                 if interval != *entry_tf {

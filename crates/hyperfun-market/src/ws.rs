@@ -44,18 +44,17 @@ impl HlWsClient {
         loop {
             match self.connect_and_stream(&symbols, &intervals, &tx).await {
                 Ok(()) => {
-                    // Clean close — reconnect immediately (server may have closed gracefully).
+                    // Clean close — connection was healthy, reset backoff.
                     info!("WS connection closed cleanly; reconnecting...");
+                    backoff_secs = 1;
                 }
                 Err(e) => {
                     warn!("WS error: {e}; reconnecting in {backoff_secs}s");
+                    sleep(Duration::from_secs(backoff_secs)).await;
+                    // Exponential backoff capped at 30 s (only on error).
+                    backoff_secs = (backoff_secs * 2).min(30);
                 }
             }
-
-            sleep(Duration::from_secs(backoff_secs)).await;
-
-            // Exponential backoff capped at 30 s.
-            backoff_secs = (backoff_secs * 2).min(30);
         }
     }
 

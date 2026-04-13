@@ -115,7 +115,7 @@ impl HlRestClient {
             .as_array()
             .ok_or_else(|| anyhow!("universe missing"))?;
 
-        let now = 0i64; // no live clock in unit-testable code; callers can adjust if needed
+        let now = chrono::Utc::now().timestamp_millis();
         let mut oi_data = Vec::new();
         let mut vlm_data = Vec::new();
 
@@ -159,7 +159,7 @@ impl HlRestClient {
             .as_array()
             .ok_or_else(|| anyhow!("assetPositions missing"))?;
 
-        let now = 0i64;
+        let now = chrono::Utc::now().timestamp_millis();
         let mut result = Vec::new();
         for ap in asset_positions {
             let pos = &ap["position"];

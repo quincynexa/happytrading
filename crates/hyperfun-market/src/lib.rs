@@ -36,7 +36,10 @@ impl MarketDataEngine {
 
     /// Fetch the last ~500 candles per symbol per timeframe from REST and load
     /// them into the CandleStore. Logs the count per symbol.
+    /// Marks the candle store as stale during the backfill and clears it after.
     pub async fn backfill(&mut self) -> Result<()> {
+        self.candle_store.set_stale(true);
+
         let symbols = &self.config.symbols.watchlist;
         let timeframes = [
             self.config.timeframes.trend.clone(),
@@ -72,6 +75,7 @@ impl MarketDataEngine {
             }
         }
 
+        self.candle_store.set_stale(false);
         Ok(())
     }
 
