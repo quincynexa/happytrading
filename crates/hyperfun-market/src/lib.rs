@@ -54,6 +54,8 @@ impl MarketDataEngine {
         let lookback_ms: i64 = 500 * 4 * 3600 * 1000;
         let start_ms = now_ms - lookback_ms;
 
+        let mut all_succeeded = true;
+
         for symbol in symbols {
             for tf in &timeframes {
                 match self
@@ -70,12 +72,17 @@ impl MarketDataEngine {
                     }
                     Err(e) => {
                         tracing::warn!(symbol = %symbol, timeframe = %tf, error = %e, "backfill failed");
+                        all_succeeded = false;
                     }
                 }
             }
         }
 
-        self.candle_store.set_stale(false);
+        if all_succeeded {
+            self.candle_store.set_stale(false);
+        } else {
+            tracing::warn!("partial backfill failure — candle store remains stale");
+        }
         Ok(())
     }
 

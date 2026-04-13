@@ -29,6 +29,8 @@ impl RunningStats {
     }
 
     /// Record a completed trade and update all running statistics.
+    /// Break-even trades (pnl == 0.0) increment total_trades but count
+    /// as neither winning nor losing.
     pub fn record_trade(&mut self, pnl: f64) {
         self.total_trades += 1;
         self.total_pnl += pnl;
@@ -37,10 +39,11 @@ impl RunningStats {
         if pnl > 0.0 {
             self.winning_trades += 1;
             self.gross_profit += pnl;
-        } else {
+        } else if pnl < 0.0 {
             self.losing_trades += 1;
             self.gross_loss += pnl.abs();
         }
+        // pnl == 0.0: break-even — counted in total_trades only
 
         // Track peak equity and max drawdown.
         if self.current_equity > self.peak_equity {
@@ -120,5 +123,16 @@ mod tests {
         stats.record_trade(100.0);
 
         assert_eq!(stats.profit_factor(), f64::INFINITY);
+    }
+
+    #[test]
+    fn break_even_trade_is_neither_win_nor_loss() {
+        let mut stats = RunningStats::new(10_000.0);
+        stats.record_trade(0.0);
+
+        assert_eq!(stats.total_trades, 1);
+        assert_eq!(stats.winning_trades, 0);
+        assert_eq!(stats.losing_trades, 0);
+        assert!((stats.total_pnl).abs() < 1e-9);
     }
 }
