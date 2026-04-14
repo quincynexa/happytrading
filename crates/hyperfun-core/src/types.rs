@@ -217,6 +217,52 @@ impl Position {
     }
 }
 
+/// Record of a single trade event (open or close), persisted to storage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeRecord {
+    pub ts: i64,
+    pub symbol: String,
+    pub event: String,          // 'open' | 'close'
+    pub direction: String,      // 'Long' | 'Short' | 'Unknown'
+    pub price: f64,
+    pub fill_price: f64,
+    pub composite: f64,
+    pub atr: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_loss: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pnl: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>, // 'signal' | 'stop_loss' | 'trailing_stop' | 'direction_flip'
+}
+
+/// State-transition output of an executor action. Main loop matches on this
+/// to decide which WriteOp to dispatch. Eliminates the previous bug where
+/// cooldown was re-persisted on every bar when the symbol was already flat.
+#[derive(Debug, Clone)]
+pub enum TradeEvent {
+    None,
+    Opened {
+        position: Position,
+        trade: TradeRecord,
+    },
+    Closed {
+        trade: TradeRecord,
+        pnl: f64,
+    },
+    Flipped {
+        close_trade: TradeRecord,
+        open_trade: TradeRecord,
+        new_position: Position,
+        pnl: f64,
+    },
+    StopLossTriggered {
+        trade: TradeRecord,
+        pnl: f64,
+        // Position already removed from executor by the time this fires
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +323,22 @@ mod tests {
         pos.fees_paid = 0.35; // entry fee
         let pnl = pos.close(51_000.0, 0.35); // exit fee
         assert!((pnl - 19.30).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trade_event_variants_distinguishable() {
+        use crate::types::TradeEvent;
+        let trade = TradeRecord {
+            ts: 0, symbol: "BTC".into(), event: "open".into(),
+            direction: "Long".into(), price: 50000.0, fill_price: 50025.0,
+            composite: 0.5, atr: 500.0, stop_loss: Some(49000.0),
+            pnl: None, reason: None,
+        };
+        let pos = Position::new("BTC", Direction::Long, 1000.0, 50025.0, 49000.0, 0);
+        let ev = TradeEvent::Opened { position: pos, trade };
+        assert!(matches!(ev, TradeEvent::Opened { .. }));
+        let none = TradeEvent::None;
+        assert!(matches!(none, TradeEvent::None));
     }
 
     #[test]
