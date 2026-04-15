@@ -322,6 +322,11 @@ impl PaperExecutor {
     pub fn get_position(&self, symbol: &str) -> Option<&Position> {
         self.positions.get(symbol)
     }
+
+    /// Restore a position from persisted storage at startup. Does NOT touch stats.
+    pub fn restore_position(&mut self, position: hyperfun_core::Position) {
+        self.positions.insert(position.symbol.clone(), position);
+    }
 }
 
 #[cfg(test)]
