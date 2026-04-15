@@ -245,6 +245,7 @@ impl PaperExecutor {
         symbol: &str,
         current_price: f64,
         atr: f64,
+        timestamp: i64,
     ) -> Option<hyperfun_core::TradeEvent> {
         use hyperfun_core::{TradeEvent, TradeRecord};
 
@@ -279,21 +280,13 @@ impl PaperExecutor {
             pos.close(close_fill, exit_fee)
         };
         self.stats.record_trade(pnl);
-
-        let was_profitable = {
-            let pos = self.positions.get(symbol).unwrap();
-            let profit = match direction {
-                Direction::Long => current_price - pos.entry_price,
-                Direction::Short => pos.entry_price - current_price,
-            };
-            profit > 0.0
-        };
         self.positions.remove(symbol);
 
+        let was_profitable = pnl > 0.0;
         let reason = if was_profitable { "trailing_stop" } else { "stop_loss" };
 
         let trade = TradeRecord {
-            ts: 0, // caller fills in actual timestamp if needed
+            ts: timestamp,
             symbol: symbol.to_string(),
             event: "close".into(),
             direction: dir_str.into(),
@@ -390,11 +383,11 @@ mod tests {
         let stop = ex.get_position("BTC").unwrap().stop_loss;
 
         // Price above stop: position still open
-        let _ = ex.check_stop_losses("BTC", stop + 100.0, 500.0);
+        let _ = ex.check_stop_losses("BTC", stop + 100.0, 500.0, 1);
         assert!(ex.has_position("BTC"));
 
         // Price at/below stop: position closes
-        let _ = ex.check_stop_losses("BTC", stop - 1.0, 500.0);
+        let _ = ex.check_stop_losses("BTC", stop - 1.0, 500.0, 2);
         assert!(!ex.has_position("BTC"));
         assert_eq!(ex.stats().total_trades, 1);
     }
@@ -410,19 +403,19 @@ mod tests {
 
         // Price moves to $50 800 — profit = 1.55 ATR (> 1.5 activation)
         // Trailing stop should activate: 50800 - 1.5*500 = 50050
-        let _ = ex.check_stop_losses("BTC", 50_800.0, 500.0);
+        let _ = ex.check_stop_losses("BTC", 50_800.0, 500.0, 1);
         assert!(ex.has_position("BTC"));
         let new_stop = ex.get_position("BTC").unwrap().stop_loss;
         assert!(new_stop > initial_stop, "trailing stop should have moved up: {} > {}", new_stop, initial_stop);
 
         // Price continues to $51 500 — trailing moves up further
-        let _ = ex.check_stop_losses("BTC", 51_500.0, 500.0);
+        let _ = ex.check_stop_losses("BTC", 51_500.0, 500.0, 2);
         assert!(ex.has_position("BTC"));
         let higher_stop = ex.get_position("BTC").unwrap().stop_loss;
         assert!(higher_stop > new_stop);
 
         // Price drops back to trailing stop level — should trigger
-        let _ = ex.check_stop_losses("BTC", higher_stop - 1.0, 500.0);
+        let _ = ex.check_stop_losses("BTC", higher_stop - 1.0, 500.0, 3);
         assert!(!ex.has_position("BTC"));
         // It was profitable — trailing stop, not initial stop
         assert!(ex.stats().total_pnl > 0.0);
@@ -467,7 +460,7 @@ mod tests {
         let mut ex = make_executor();
         let _ = ex.execute_signal(SignalAction::Open(Direction::Long), "BTC", 50_000.0, 500.0, 0);
         let stop = ex.get_position("BTC").unwrap().stop_loss;
-        let ev = ex.check_stop_losses("BTC", stop - 1.0, 500.0);
+        let ev = ex.check_stop_losses("BTC", stop - 1.0, 500.0, 1);
         match ev {
             Some(TradeEvent::StopLossTriggered { trade, pnl }) => {
                 assert_eq!(trade.event, "close");
