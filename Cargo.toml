@@ -5,6 +5,7 @@ members = [
     "crates/hyperfun-market",
     "crates/hyperfun-signal",
     "crates/hyperfun-executor",
+    "crates/hyperfun-storage",
 ]
 
 [workspace.dependencies]
@@ -20,6 +21,10 @@ ta = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 thiserror = "2"
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio", "postgres", "macros", "chrono", "json", "migrate"
+] }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [package]
 name = "hyperfun"
