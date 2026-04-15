@@ -4,32 +4,25 @@ use hyperfun_core::{Direction, SignalAction};
 pub struct SignalAggregator {
     open_threshold: f64,
     close_threshold: f64,
-    cooldown_bars: u64,
+    cooldown_bars: u32,
+    entry_interval_ms: i64,
     current_positions: HashMap<String, Direction>,
-    /// Tracks how many bar-close ticks have elapsed since the last close per symbol.
-    /// Absent = no cooldown active.
-    cooldown_remaining: HashMap<String, u64>,
+    /// symbol -> cooldown_until_ts (in bar close_time timebase)
+    cooldown_until: HashMap<String, i64>,
 }
 
 impl SignalAggregator {
-    pub fn new(open_threshold: f64, close_threshold: f64, cooldown_bars: u64) -> Self {
+    pub fn new(open_threshold: f64, close_threshold: f64, cooldown_bars: u32, entry_interval_ms: i64) -> Self {
         Self {
             open_threshold,
             close_threshold,
             cooldown_bars,
+            entry_interval_ms,
             current_positions: HashMap::new(),
-            cooldown_remaining: HashMap::new(),
+            cooldown_until: HashMap::new(),
         }
     }
 
-    /// Compute a weighted composite score from factor group scores.
-    ///
-    /// Each entry is (group_name, weight, Option<score>).
-    /// Groups with `None` score are excluded entirely. Weights of the
-    /// remaining (ready) groups are **renormalized** so they sum to 1.0,
-    /// ensuring the composite stays in [-1, 1] regardless of how many
-    /// groups are ready.
-    /// Returns (composite_score, detail_vec).
     pub fn compute_score(
         &self,
         factor_scores: &[(&str, f64, Option<f64>)],
@@ -46,39 +39,29 @@ impl SignalAggregator {
             }
         }
 
-        let composite = if total_weight > 0.0 {
-            weighted_sum / total_weight
-        } else {
-            0.0
-        };
-
+        let composite = if total_weight > 0.0 { weighted_sum / total_weight } else { 0.0 };
         (composite, details)
     }
 
-    /// Determine what action to take for a symbol given its composite score.
-    /// Must be called once per bar-close per symbol so cooldown ticks down correctly.
-    pub fn decide(&mut self, symbol: &str, composite_score: f64) -> SignalAction {
-        // Tick down cooldown
-        let in_cooldown = if let Some(remaining) = self.cooldown_remaining.get_mut(symbol) {
-            if *remaining > 0 {
-                *remaining -= 1;
-                true
-            } else {
-                self.cooldown_remaining.remove(symbol);
-                false
+    /// Decide an action given composite score and the current bar's close_time.
+    pub fn decide(&mut self, symbol: &str, composite_score: f64, current_close_ts: i64) -> SignalAction {
+        let in_cooldown = self.cooldown_until
+            .get(symbol)
+            .map(|until| current_close_ts < *until)
+            .unwrap_or(false);
+
+        // Expire stale entries
+        if let Some(until) = self.cooldown_until.get(symbol) {
+            if current_close_ts >= *until {
+                self.cooldown_until.remove(symbol);
             }
-        } else {
-            false
-        };
+        }
 
         let position = self.current_positions.get(symbol).copied();
 
         match position {
             None => {
-                // During cooldown, suppress new opens
-                if in_cooldown {
-                    return SignalAction::Hold;
-                }
+                if in_cooldown { return SignalAction::Hold; }
                 if composite_score > self.open_threshold {
                     SignalAction::Open(Direction::Long)
                 } else if composite_score < -self.open_threshold {
@@ -89,7 +72,6 @@ impl SignalAggregator {
             }
             Some(Direction::Long) => {
                 if composite_score < -self.open_threshold && !in_cooldown {
-                    // Flip to short
                     SignalAction::Open(Direction::Short)
                 } else if composite_score.abs() < self.close_threshold {
                     SignalAction::Close
@@ -99,7 +81,6 @@ impl SignalAggregator {
             }
             Some(Direction::Short) => {
                 if composite_score > self.open_threshold && !in_cooldown {
-                    // Flip to long
                     SignalAction::Open(Direction::Long)
                 } else if composite_score.abs() < self.close_threshold {
                     SignalAction::Close
@@ -114,16 +95,40 @@ impl SignalAggregator {
         self.current_positions.insert(symbol.to_string(), direction);
     }
 
-    pub fn clear_position(&mut self, symbol: &str) {
-        self.current_positions.remove(symbol);
-        // Start cooldown when a position is closed
-        if self.cooldown_bars > 0 {
-            self.cooldown_remaining.insert(symbol.to_string(), self.cooldown_bars);
+    /// Clear a position. If a position existed, starts a cooldown.
+    /// Takes `closed_ts` (the close_time of the bar on which the close happened).
+    /// Returns Some(cooldown_until_ts) if a cooldown was created, None otherwise.
+    pub fn clear_position(&mut self, symbol: &str, closed_ts: i64) -> Option<i64> {
+        let had_position = self.current_positions.remove(symbol).is_some();
+        if had_position && self.cooldown_bars > 0 {
+            let until = closed_ts + (self.cooldown_bars as i64) * self.entry_interval_ms;
+            self.cooldown_until.insert(symbol.to_string(), until);
+            Some(until)
+        } else {
+            None
         }
     }
 
     pub fn has_position(&self, symbol: &str) -> bool {
         self.current_positions.contains_key(symbol)
+    }
+
+    /// Restore a cooldown from persisted storage. If the persisted `cooldown_bars`
+    /// differs from the current config value, the cooldown is NOT restored
+    /// (config-change-takes-effect-on-next-close rule).
+    pub fn restore_cooldown(&mut self, symbol: &str, cooldown_until_ts: i64, persisted_bars: u32) {
+        if persisted_bars == self.cooldown_bars {
+            self.cooldown_until.insert(symbol.to_string(), cooldown_until_ts);
+        }
+        // else: drop the row — new config applies on next close
+    }
+
+    pub fn cooldown_until(&self, symbol: &str) -> Option<i64> {
+        self.cooldown_until.get(symbol).copied()
+    }
+
+    pub fn cooldown_bars(&self) -> u32 {
+        self.cooldown_bars
     }
 }
 
@@ -134,7 +139,7 @@ mod tests {
 
     #[test]
     fn test_compute_score_weights() {
-        let agg = SignalAggregator::new(0.6, 0.2, 0);
+        let agg = SignalAggregator::new(0.6, 0.2, 0, 900_000);
         let factors = [
             ("trend", 2.0, Some(0.8f64)),
             ("momentum", 1.0, None),
@@ -148,63 +153,66 @@ mod tests {
 
     #[test]
     fn test_decide_open_long() {
-        let mut agg = SignalAggregator::new(0.6, 0.2, 0);
-        let action = agg.decide("BTC", 0.7);
+        let mut agg = SignalAggregator::new(0.6, 0.2, 0, 900_000);
+        let action = agg.decide("BTC", 0.7, 1_000_000);
         assert_eq!(action, SignalAction::Open(Direction::Long));
     }
 
     #[test]
     fn test_decide_hold_when_already_positioned() {
-        let mut agg = SignalAggregator::new(0.6, 0.2, 0);
+        let mut agg = SignalAggregator::new(0.6, 0.2, 0, 900_000);
         agg.set_position("BTC", Direction::Long);
-        let action = agg.decide("BTC", 0.8);
+        let action = agg.decide("BTC", 0.8, 1_000_000);
         assert_eq!(action, SignalAction::Hold);
     }
 
     #[test]
     fn test_decide_close_when_score_weak() {
-        let mut agg = SignalAggregator::new(0.6, 0.2, 0);
+        let mut agg = SignalAggregator::new(0.6, 0.2, 0, 900_000);
         agg.set_position("BTC", Direction::Long);
-        let action = agg.decide("BTC", 0.1);
+        let action = agg.decide("BTC", 0.1, 1_000_000);
         assert_eq!(action, SignalAction::Close);
     }
 
     #[test]
     fn test_decide_flip_direction() {
-        let mut agg = SignalAggregator::new(0.6, 0.2, 0);
+        let mut agg = SignalAggregator::new(0.6, 0.2, 0, 900_000);
         agg.set_position("BTC", Direction::Long);
-        let action = agg.decide("BTC", -0.7);
+        let action = agg.decide("BTC", -0.7, 1_000_000);
         assert_eq!(action, SignalAction::Open(Direction::Short));
     }
 
     #[test]
-    fn test_cooldown_suppresses_open_after_close() {
-        let mut agg = SignalAggregator::new(0.6, 0.2, 2);
+    fn cooldown_uses_close_time_not_bar_count() {
+        // 15m interval = 900_000 ms, 3 bars cooldown = 2_700_000 ms
+        let mut agg = SignalAggregator::new(0.6, 0.2, 3, 900_000);
         agg.set_position("BTC", Direction::Long);
-        // Close the position
-        agg.clear_position("BTC");
+        agg.clear_position("BTC", 1_000_000); // close_time of the closing bar
 
-        // Bar 1: still in cooldown — should Hold even with strong signal
-        let action = agg.decide("BTC", 0.9);
-        assert_eq!(action, SignalAction::Hold);
+        // Next bar at t=1_900_000 (1 bar later) -> still in cooldown
+        let action = agg.decide("BTC", 0.9, 1_900_000);
+        assert_eq!(action, SignalAction::Hold, "should be in cooldown");
 
-        // Bar 2: still in cooldown
-        let action = agg.decide("BTC", 0.9);
-        assert_eq!(action, SignalAction::Hold);
-
-        // Bar 3: cooldown expired — should Open
-        let action = agg.decide("BTC", 0.9);
-        assert_eq!(action, SignalAction::Open(Direction::Long));
+        // Bar at t=3_700_000 (3 bars later = cooldown_until) -> released
+        let action = agg.decide("BTC", 0.9, 3_700_000);
+        assert_eq!(action, SignalAction::Open(Direction::Long), "cooldown expired");
     }
 
     #[test]
-    fn test_cooldown_zero_means_no_cooldown() {
-        let mut agg = SignalAggregator::new(0.6, 0.2, 0);
-        agg.set_position("BTC", Direction::Long);
-        agg.clear_position("BTC");
+    fn clear_position_only_creates_cooldown_when_position_existed() {
+        // Regression test for the write-amplification bug: calling
+        // clear_position on a flat symbol must NOT create a cooldown.
+        let mut agg = SignalAggregator::new(0.6, 0.2, 3, 900_000);
+        agg.clear_position("BTC", 1_000_000); // no position exists
+        assert!(agg.cooldown_until("BTC").is_none(), "no cooldown for flat symbol");
+    }
 
-        // Immediately can open again
-        let action = agg.decide("BTC", 0.9);
-        assert_eq!(action, SignalAction::Open(Direction::Long));
+    #[test]
+    fn cooldown_config_change_detection() {
+        let mut agg = SignalAggregator::new(0.6, 0.2, 3, 900_000);
+        // Simulate loading a persisted cooldown that was set with cooldown_bars=5
+        agg.restore_cooldown("BTC", 10_000_000, 5);
+        // Current config says 3, so the loaded cooldown should be dropped
+        assert!(agg.cooldown_until("BTC").is_none(), "mismatched cooldown_bars should drop row");
     }
 }
