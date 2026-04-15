@@ -15,6 +15,7 @@ pub use handle::StorageHandle;
 pub use journal::JournalWriter;
 pub use ops::{BarScoreRecord, WriteOp};
 pub use writer::{spawn_reconnect_task, spawn_writer_task, StorageWriter};
+pub use loader::{CandleCoverage, CooldownState, load_candles_bulk, load_cooldowns, load_positions, max_close_times};
 
 pub use hyperfun_core::{Candle, Position, TradeEvent, TradeRecord};
 pub use hyperfun_core::config::StorageConfig;
