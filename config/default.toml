@@ -63,3 +63,7 @@ summary_interval_mins = 60
 [hyperliquid]
 ws_url = "wss://api.hyperliquid.xyz/ws"
 rest_url = "https://api.hyperliquid.xyz"
+
+[storage]
+pool_size = 5
+reconnect_secs = 60

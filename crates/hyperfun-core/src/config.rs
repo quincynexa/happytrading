@@ -9,6 +9,7 @@ pub struct AppConfig {
     pub signal: SignalConfig,
     pub paper: PaperConfig,
     pub hyperliquid: HyperliquidConfig,
+    pub storage: StorageConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +112,15 @@ pub struct HyperliquidConfig {
     pub rest_url: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    pub pool_size: u32,
+    #[serde(default = "default_reconnect_secs")]
+    pub reconnect_secs: u64,
+}
+
+fn default_reconnect_secs() -> u64 { 60 }
+
 impl AppConfig {
     pub fn load() -> Result<Self, config::ConfigError> {
         let cfg = config::Config::builder()
@@ -158,5 +168,7 @@ mod tests {
         assert!((app.signal.close_threshold - 0.12).abs() < f64::EPSILON);
         assert_eq!(app.paper.position_size_usd, 1000.0);
         assert_eq!(app.hyperliquid.ws_url, "wss://api.hyperliquid.xyz/ws");
+        assert_eq!(app.storage.pool_size, 5);
+        assert_eq!(app.storage.reconnect_secs, 60);
     }
 }
