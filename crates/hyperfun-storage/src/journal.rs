@@ -4,6 +4,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use serde::Serialize;
+use tracing;
 
 use crate::ops::BarScoreRecord;
 use hyperfun_core::{Candle, Position, TradeRecord};
@@ -79,9 +80,15 @@ impl JournalWriter {
 }
 
 fn write_line<T: Serialize, W: Write>(w: &mut W, value: &T) {
-    if let Ok(line) = serde_json::to_string(value) {
-        let _ = writeln!(w, "{}", line);
-        let _ = w.flush();
+    match serde_json::to_string(value) {
+        Ok(line) => {
+            if let Err(e) = writeln!(w, "{}", line) {
+                tracing::error!(error = %e, "JSONL write failed");
+            } else if let Err(e) = w.flush() {
+                tracing::error!(error = %e, "JSONL flush failed");
+            }
+        }
+        Err(e) => tracing::error!(error = %e, "JSONL serialization failed"),
     }
 }
 

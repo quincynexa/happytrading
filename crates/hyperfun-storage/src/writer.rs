@@ -161,7 +161,11 @@ async fn insert_position(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, p: &hyp
     let now = chrono::Utc::now().timestamp_millis();
     sqlx::query(
         "INSERT INTO positions (symbol, direction, size_usd, entry_price, entry_time, stop_loss, extreme_price, fees_paid, funding_paid, updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)"
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+         ON CONFLICT (symbol) DO UPDATE SET \
+         direction = EXCLUDED.direction, size_usd = EXCLUDED.size_usd, entry_price = EXCLUDED.entry_price, \
+         entry_time = EXCLUDED.entry_time, stop_loss = EXCLUDED.stop_loss, extreme_price = EXCLUDED.extreme_price, \
+         fees_paid = EXCLUDED.fees_paid, funding_paid = EXCLUDED.funding_paid, updated_at = EXCLUDED.updated_at"
     )
     .bind(&p.symbol).bind(dir).bind(p.size_usd).bind(p.entry_price).bind(p.entry_time)
     .bind(p.stop_loss).bind(p.extreme_price).bind(p.fees_paid).bind(p.funding_paid).bind(now)
@@ -215,6 +219,7 @@ pub fn spawn_reconnect_task(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(reconnect_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await; // skip immediate first tick
         loop {
             interval.tick().await;
