@@ -5,9 +5,16 @@
 pub mod config;
 pub mod ops;
 pub mod handle;
+pub mod journal;
 pub mod writer;
 pub mod loader;
 pub mod rollup;
 
-// Re-export core types used across the API
+pub use config::parse_database_url_redacted;
+pub use handle::StorageHandle;
+pub use journal::JournalWriter;
+pub use ops::{BarScoreRecord, WriteOp};
+pub use writer::{spawn_reconnect_task, spawn_writer_task, StorageWriter};
+
 pub use hyperfun_core::{Candle, Position, TradeEvent, TradeRecord};
+pub use hyperfun_core::config::StorageConfig;
