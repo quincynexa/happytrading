@@ -6,7 +6,6 @@ pub mod ws;
 
 use anyhow::Result;
 use hyperfun_core::config::AppConfig;
-use tracing::info;
 
 use crate::candle_store::CandleStore;
 use crate::rest::HlRestClient;
@@ -34,10 +33,14 @@ impl MarketDataEngine {
         }
     }
 
-    /// Fetch the last ~500 candles per symbol per timeframe from REST and load
-    /// them into the CandleStore. Logs the count per symbol.
-    /// Marks the candle store as stale during the backfill and clears it after.
-    pub async fn backfill(&mut self) -> Result<()> {
+    /// Backfill with optional per-key start overrides.
+    /// `start_overrides` is a map of (symbol, interval) -> start_ms from cache.
+    /// If the override implies cache has enough coverage, fetch only the gap.
+    /// Otherwise fall through to the full 500-bar fetch.
+    pub async fn backfill_incremental(
+        &mut self,
+        start_overrides: &std::collections::HashMap<(String, String), i64>,
+    ) -> Result<()> {
         self.candle_store.set_stale(true);
 
         let symbols = &self.config.symbols.watchlist;
@@ -46,18 +49,19 @@ impl MarketDataEngine {
             self.config.timeframes.entry.clone(),
         ];
 
-        // Use a generous time window: 500 candles of the largest timeframe.
-        // For simplicity we use a very wide window and let the server return
-        // at most 500 candles.
         let now_ms = chrono::Utc::now().timestamp_millis();
-        // 500 candles * 4 h * 3600 s * 1000 ms — works for all supported intervals
-        let lookback_ms: i64 = 500 * 4 * 3600 * 1000;
-        let start_ms = now_ms - lookback_ms;
+        let full_lookback: i64 = 500 * 4 * 3600 * 1000;
+        let full_start = now_ms - full_lookback;
 
         let mut all_succeeded = true;
-
         for symbol in symbols {
             for tf in &timeframes {
+                let key = (symbol.clone(), tf.clone());
+                let start_ms = match start_overrides.get(&key) {
+                    Some(&override_start) => override_start + 1,
+                    None => full_start,
+                };
+
                 match self
                     .rest_client
                     .fetch_candles(symbol, tf, start_ms, now_ms)
@@ -68,10 +72,10 @@ impl MarketDataEngine {
                         for candle in candles {
                             self.candle_store.push(candle);
                         }
-                        info!(symbol = %symbol, timeframe = %tf, count, "backfill complete");
+                        tracing::info!(symbol = %symbol, timeframe = %tf, count, start_ms, "backfill_incremental complete");
                     }
                     Err(e) => {
-                        tracing::warn!(symbol = %symbol, timeframe = %tf, error = %e, "backfill failed");
+                        tracing::warn!(symbol = %symbol, timeframe = %tf, error = %e, "backfill_incremental failed");
                         all_succeeded = false;
                     }
                 }
@@ -81,9 +85,16 @@ impl MarketDataEngine {
         if all_succeeded {
             self.candle_store.set_stale(false);
         } else {
-            tracing::warn!("partial backfill failure — candle store remains stale");
+            tracing::warn!("partial backfill_incremental failure — candle store remains stale");
         }
         Ok(())
+    }
+
+    /// Fetch the last ~500 candles per symbol per timeframe from REST and load
+    /// them into the CandleStore. Logs the count per symbol.
+    /// Marks the candle store as stale during the backfill and clears it after.
+    pub async fn backfill(&mut self) -> Result<()> {
+        self.backfill_incremental(&std::collections::HashMap::new()).await
     }
 
     pub fn candle_store(&self) -> &CandleStore {
