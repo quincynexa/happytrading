@@ -91,7 +91,7 @@ pub struct MtfConfig {
 pub struct SignalConfig {
     pub open_threshold: f64,
     pub close_threshold: f64,
-    pub cooldown_bars: u64,
+    pub cooldown_bars: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

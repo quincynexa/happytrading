@@ -23,6 +23,8 @@ impl SignalAggregator {
         }
     }
 
+    /// Compute a weighted composite score from a list of `(name, weight, Option<score>)`.
+    /// Factors with `None` score are excluded from the weighted average (renormalization).
     pub fn compute_score(
         &self,
         factor_scores: &[(&str, f64, Option<f64>)],
@@ -45,17 +47,11 @@ impl SignalAggregator {
 
     /// Decide an action given composite score and the current bar's close_time.
     pub fn decide(&mut self, symbol: &str, composite_score: f64, current_close_ts: i64) -> SignalAction {
-        let in_cooldown = self.cooldown_until
-            .get(symbol)
-            .map(|until| current_close_ts < *until)
-            .unwrap_or(false);
-
-        // Expire stale entries
-        if let Some(until) = self.cooldown_until.get(symbol) {
-            if current_close_ts >= *until {
-                self.cooldown_until.remove(symbol);
-            }
-        }
+        let in_cooldown = match self.cooldown_until.get(symbol).copied() {
+            Some(until) if current_close_ts < until => true,
+            Some(_) => { self.cooldown_until.remove(symbol); false }
+            None => false,
+        };
 
         let position = self.current_positions.get(symbol).copied();
 
