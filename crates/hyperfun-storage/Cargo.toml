@@ -16,6 +16,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+hyperfun-signal = { path = "../hyperfun-signal" }
 
 [features]
 integration-tests = []
