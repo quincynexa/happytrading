@@ -150,6 +150,7 @@ async fn main() -> Result<()> {
     let _reconnect_join = spawn_reconnect_task(
         pool.clone(), connect_opts, config.storage.pool_size, config.storage.reconnect_secs,
     );
+    let _daily_join = hyperfun_storage::spawn_daily_task(pool.clone());
 
     // 5. MarketDataEngine, with cache-aware backfill
     let mut engine = MarketDataEngine::new(&config);
