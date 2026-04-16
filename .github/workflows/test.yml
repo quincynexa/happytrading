@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: hyperfun
+          POSTGRES_PASSWORD: hyperfun
+          POSTGRES_DB: hyperfun_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U hyperfun"
+          --health-interval=10s --health-timeout=5s --health-retries=5
+
+    env:
+      DATABASE_URL: postgres://hyperfun:hyperfun@localhost:5432/hyperfun_test
+      SQLX_OFFLINE: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Build
+        run: cargo build --workspace
+      - name: Test
+        run: cargo test --workspace --features integration-tests
