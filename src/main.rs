@@ -170,7 +170,6 @@ async fn main() -> Result<()> {
         match hyperfun_storage::max_close_times(pool_ref).await {
             Ok(covs) => {
                 for cov in covs {
-                    let _interval_ms = parse_interval_ms(&cov.interval);
                     let expected_count: i64 = 500;
                     let coverage_ok = cov.count >= (expected_count * 95 / 100) && cov.count >= 100;
                     if coverage_ok {
@@ -252,11 +251,14 @@ async fn main() -> Result<()> {
         warn!("pool unavailable at startup — positions and cooldowns not restored (JSONL mode)");
     }
 
-    run_main_loop(&mut engine, symbol_states, aggregator, executor, storage_handle, &config, entry_interval_ms).await
+    run_main_loop(&mut engine, symbol_states, aggregator, executor, storage_handle, &config).await
 }
 
 fn parse_interval_ms(interval: &str) -> i64 {
-    let (num_str, unit) = interval.split_at(interval.len() - 1);
+    if interval.is_empty() {
+        return 60_000;
+    }
+    let (num_str, unit) = interval.split_at(interval.len().saturating_sub(1));
     let n: i64 = num_str.parse().unwrap_or(0);
     let unit_ms: i64 = match unit {
         "m" => 60_000,
@@ -274,7 +276,6 @@ async fn run_main_loop(
     mut executor: PaperExecutor,
     storage_handle: StorageHandle,
     config: &AppConfig,
-    entry_interval_ms: i64,
 ) -> Result<()> {
     let entry_tf = config.timeframes.entry.clone();
     let trend_tf = config.timeframes.trend.clone();
@@ -351,7 +352,7 @@ async fn run_main_loop(
                 // Stop-loss check on bar-close
                 let current_atr_for_stop = state.atr_for_stop.atr_value();
                 if let Some(stop_event) = executor.check_stop_losses(&symbol, closed_price, current_atr_for_stop, closed_ts) {
-                    handle_trade_event(stop_event, &mut aggregator, &storage_handle, closed_ts, &symbol, entry_interval_ms).await;
+                    handle_trade_event(stop_event, &mut aggregator, &storage_handle, closed_ts, &symbol).await;
                 }
 
                 // Update indicators with closed bar
@@ -447,7 +448,7 @@ async fn run_main_loop(
                         "signal executed"
                     );
                 }
-                handle_trade_event(event, &mut aggregator, &storage_handle, closed_ts, &symbol, entry_interval_ms).await;
+                handle_trade_event(event, &mut aggregator, &storage_handle, closed_ts, &symbol).await;
 
                 executor.update_unrealized_pnl(&symbol, closed_price);
 
@@ -484,7 +485,6 @@ async fn handle_trade_event(
     storage: &StorageHandle,
     closed_ts: i64,
     symbol: &str,
-    entry_interval_ms: i64,
 ) {
     let cooldown_bars = aggregator.cooldown_bars();
     match event {
@@ -507,9 +507,8 @@ async fn handle_trade_event(
         TradeEvent::Flipped { mut close_trade, mut open_trade, new_position, .. } => {
             close_trade.ts = closed_ts;
             open_trade.ts = closed_ts;
-            let _ = aggregator.clear_position(symbol, closed_ts);
+            let until = aggregator.clear_position(symbol, closed_ts).unwrap_or(closed_ts);
             aggregator.set_position(symbol, new_position.direction);
-            let until = closed_ts + (cooldown_bars as i64) * entry_interval_ms;
             let _ = storage.send_with_timeout(WriteOp::FlipTrade {
                 close_trade,
                 open_trade,
